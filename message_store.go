@@ -84,7 +84,7 @@ func newMessage(sessionID string, raw json.RawMessage, status MessageStatus) Mes
 
 // insertMessage assigns the next seq and stores m.
 func insertMessage(ctx context.Context, store Store, m *Message) error {
-	rows, err := store.Query(ctx, "SELECT COALESCE(MAX(seq), 0) FROM agent_messages WHERE session_id = ?", m.SessionID)
+	rows, err := store.Query(ctx, "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM agent_messages WHERE session_id = ?", m.SessionID)
 	if err != nil {
 		return err
 	}

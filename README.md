@@ -558,6 +558,8 @@ type Billing interface { Cost(model string, usage agent.Usage) agent.Cost }
 
 计算方式：非缓存输入 = `prompt_tokens - cached_tokens - cache_write_tokens`，分别乘以对应单价。
 
+只按输出计费时，其它单价留 0 即可：`agent.Pricing{Output: 600}`。积分是小数；需要取整或设最低收费（比如每次最少 1 积分）时，在 `SettleUsage` 的 `charge` 里对 `b.Summary.Cost.Total` 处理，SDK 不替你取整——取整规则属于你的账本。
+
 查询：
 
 ```go
@@ -693,6 +695,11 @@ type Store interface {
 }
 // Rows 与 *sql.Rows 一致：Next / Scan / Err / Close
 ```
+
+自己实现 `Store` 时要注意：
+
+- SDK 的 `Scan` 目标只有 `*string`、`*int64`、`*float64` 三种。基于 HTTP 网关的实现（结果行是 JSON）需要自己做类型转换：数字可能是 JSON number，Postgres 的 `SUM(bigint)` 是 `numeric`，经过网关常常变成字符串。
+- SDK 的每个查询结果列名都唯一（聚合列都带 `AS` 别名），所以把结果行按列名存成 JSON 对象、再按 `columns` 顺序取值是安全的。
 
 表结构（前缀 `agent_`，时间统一为毫秒时间戳 BIGINT）：
 

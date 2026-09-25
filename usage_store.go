@@ -62,13 +62,20 @@ func listUsage(ctx context.Context, store Store, sessionID string) ([]UsageRecor
 
 // sessionUsage sums token usage and credits over all LLM calls of a session.
 func sessionUsage(ctx context.Context, store Store, sessionID string) (*UsageSummary, error) {
-	rows, err := store.Query(ctx, `SELECT COUNT(*),
-		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0),
-		COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(reasoning_tokens), 0),
-		COALESCE(SUM(audio_input_tokens), 0), COALESCE(SUM(audio_output_tokens), 0),
-		COALESCE(SUM(accepted_prediction_tokens), 0), COALESCE(SUM(rejected_prediction_tokens), 0),
-		COALESCE(SUM(input_credits), 0), COALESCE(SUM(cached_credits), 0), COALESCE(SUM(cache_write_credits), 0),
-		COALESCE(SUM(output_credits), 0), COALESCE(SUM(total_credits), 0)
+	// Every result column carries its own alias. Positional drivers do not care,
+	// but a Store backed by an HTTP SQL gateway typically returns each row as a
+	// JSON object keyed by column name, and fifteen unaliased COALESCE(...)
+	// columns would all be named "coalesce" and collapse into one value.
+	rows, err := store.Query(ctx, `SELECT COUNT(*) AS calls,
+		COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+		COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+		COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+		COALESCE(SUM(audio_input_tokens), 0) AS audio_input_tokens, COALESCE(SUM(audio_output_tokens), 0) AS audio_output_tokens,
+		COALESCE(SUM(accepted_prediction_tokens), 0) AS accepted_prediction_tokens,
+		COALESCE(SUM(rejected_prediction_tokens), 0) AS rejected_prediction_tokens,
+		COALESCE(SUM(input_credits), 0) AS input_credits, COALESCE(SUM(cached_credits), 0) AS cached_credits,
+		COALESCE(SUM(cache_write_credits), 0) AS cache_write_credits, COALESCE(SUM(output_credits), 0) AS output_credits,
+		COALESCE(SUM(total_credits), 0) AS total_credits
 		FROM agent_llm_calls WHERE session_id = ?`, sessionID)
 	if err != nil {
 		return nil, err
@@ -89,7 +96,7 @@ func sessionUsage(ctx context.Context, store Store, sessionID string) (*UsageSum
 // lastCallSize returns prompt+completion tokens of the latest LLM call and the
 // seq of the assistant message it produced.
 func lastCallSize(ctx context.Context, store Store, sessionID string) (tokens, seq int64, ok bool, err error) {
-	rows, err := store.Query(ctx, `SELECT c.prompt_tokens + c.completion_tokens, m.seq
+	rows, err := store.Query(ctx, `SELECT c.prompt_tokens + c.completion_tokens AS tokens, m.seq AS seq
 		FROM agent_llm_calls c JOIN agent_messages m ON m.id = c.message_id
 		WHERE c.session_id = ? AND m.role = 'assistant' ORDER BY m.seq DESC LIMIT 1`, sessionID)
 	if err != nil {

@@ -145,6 +145,7 @@ func toolCall(id, method, params string) string {
 func text(s string) string { return fmt.Sprintf(`{"role":"assistant","content":%q}`, s) }
 
 type env struct {
+	db     *sql.DB
 	store  agent.Store
 	client *agent.Client
 	llm    *fakeLLM
@@ -191,7 +192,7 @@ func setup(t *testing.T, methods ...agent.Method) *env {
 	if _, err := agent.NewClient(ctx, cfg); err != nil { // init is idempotent
 		t.Fatal(err)
 	}
-	return &env{store: store, client: client, llm: f, cfg: cfg}
+	return &env{db: db, store: store, client: client, llm: f, cfg: cfg}
 }
 
 func (e *env) newAgent(t *testing.T, sessionID string) *agent.Agent {

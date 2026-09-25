@@ -29,7 +29,12 @@ settlement. User-facing docs are in `README.md` (Chinese).
   - all columns `NOT NULL`, always inserted explicitly (MySQL TEXT has no default);
   - MySQL indexes are declared inline (no `CREATE INDEX IF NOT EXISTS`);
   - don't trust RowsAffected (MySQL reports changed rows); read back instead
-    (see `acquire`).
+    (see `acquire`);
+  - every result column name must be UNIQUE — alias aggregates and expressions
+    (`COUNT(*) AS calls`). Stores backed by an HTTP SQL gateway return rows as
+    JSON objects keyed by column name, and Postgres names every unaliased
+    `COALESCE(...)` "coalesce", so duplicates silently collapse. Covered by
+    `examples/namedstore_test.go`, which names columns the Postgres way.
 - Caller-built user messages (`ChatMessage`, `EnqueueMessage`) go through
   `checkUserMessage`: only `text` / `image_url` parts, images must be http(s)
   URLs (no base64). The token estimate counts each image as 500 tokens.
