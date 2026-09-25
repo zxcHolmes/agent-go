@@ -85,7 +85,7 @@ type Call struct {
 	Method     string
 	Params     json.RawMessage
 	ID         json.RawMessage // JSON-RPC request id
-	// ContextParams are the values given in Config.ContextParams, e.g. the
+	// ContextParams are the values given in AgentOptions.ContextParams, e.g. the
 	// authenticated user. They are never sent to the model.
 	ContextParams map[string]any
 }
@@ -235,7 +235,7 @@ func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage)
 		Method:        rec.Method,
 		Params:        rec.Params,
 		ID:            rec.RPCID,
-		ContextParams: a.cfg.ContextParams,
+		ContextParams: a.contextParams,
 	}
 	defer func() {
 		if r := recover(); r != nil {

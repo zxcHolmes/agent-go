@@ -42,25 +42,20 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	store := agent.NewSQLStore(db, agent.SQLite)
-	if err := agent.Init(ctx, store); err != nil {
-		log.Fatal(err)
-	}
-
-	a, err := agent.New(ctx, agent.Config{
+	// One client per database, created at startup: it creates the tables and
+	// recovers sessions left running by a crash.
+	client, err := agent.NewClient(ctx, agent.Config{
+		Store:           agent.NewSQLStore(db, agent.SQLite),
+		Billing:         agent.Pricing{Input: 100, Output: 1000, CacheRead: 10},
 		BaseURL:         os.Getenv("OPENAI_BASE_URL"),
 		APIKey:          os.Getenv("OPENAI_API_KEY"),
 		Model:           os.Getenv("MODEL"),
 		ContextLength:   128000,
 		MaxOutputTokens: 4096,
-		SessionID:       os.Getenv("SESSION_ID"), // empty = new session
 		SystemPrompt:    "You are a customer support agent. Be concise.",
 		RPCDoc:          "Order ids look like ORD-123. Refund amounts are in USD.",
-		ContextParams:   map[string]any{"user_id": "u_42"},
-		Store:           store,
-		Billing:         agent.Pricing{Input: 100, Output: 1000, CacheRead: 10},
 		// Print tokens as they stream in. A web frontend would instead poll
-		// agent.MessagesAfter(cursor), which is refreshed every StreamFlushInterval.
+		// client.MessagesAfter(cursor), which is refreshed every StreamFlushInterval.
 		OnStream: func(ctx context.Context, messageID, content, reasoning string) {
 			fmt.Print(content)
 		},
@@ -80,6 +75,14 @@ func main() {
 				RequireConfirm: true,
 			}),
 		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// One agent per session; context params identify the current user.
+	a, err := client.Agent(ctx, os.Getenv("SESSION_ID"), agent.AgentOptions{ // empty = new session
+		ContextParams: map[string]any{"user_id": "u_42"},
 	})
 	if err != nil {
 		log.Fatal(err)

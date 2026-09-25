@@ -7,7 +7,7 @@
 - 消息按原始 JSON 字节完整保存并原样回放，保证大模型**前缀缓存**不丢失。
 - **流式输出**：助手消息边生成边写库（默认每 2 秒刷新一次，可配置），前端轮询数据库即可拿到实时内容。
 - 支持需要人工确认的 RPC 方法、Stop / Continue、跨进程的会话锁。
-- **崩溃恢复**：进程挂掉后，`Init` 会把卡住的会话、写了一半的消息、执行中的工具调用恢复成一致状态，可以直接继续对话。
+- **崩溃恢复**：进程挂掉后，`NewClient` 启动时会把卡住的会话、写了一半的消息、执行中的工具调用恢复成一致状态，可以直接继续对话。
 
 ## 安装
 
@@ -67,29 +67,19 @@ type RefundParams struct {
 func main() {
 	ctx := context.Background()
 
-	// 1. 存储层 + 全局初始化（建表，幂等，启动时调用一次）
+	// 1. 启动时创建一个 Client：存储层、计费、大模型和 RPC 方法等全局配置只设置这一次。
+	//    它会建表（幂等），并恢复上次进程崩溃留下的会话。
 	db, _ := sql.Open("sqlite", "file:agent.db?_pragma=busy_timeout(5000)")
-	store := agent.NewSQLStore(db, agent.SQLite)
-	if err := agent.Init(ctx, store); err != nil {
-		log.Fatal(err)
-	}
-
-	// 2. 创建会话，拿到 session id（可附带 metadata，比如所属用户）
-	sessionID, _ := agent.CreateSession(ctx, store, map[string]any{"user_id": "u_42"})
-
-	// 3. 创建 agent
-	a, err := agent.New(ctx, agent.Config{
+	client, err := agent.NewClient(ctx, agent.Config{
+		Store:           agent.NewSQLStore(db, agent.SQLite),
+		Billing:         agent.Pricing{Input: 100, Output: 1000, CacheRead: 10}, // 每百万 token 的积分
 		BaseURL:         "https://api.openai.com/v1", // 任意 OpenAI 兼容地址
 		APIKey:          "sk-...",
 		Model:           "gpt-4o-mini",
 		ContextLength:   128000, // 模型上下文长度
 		MaxOutputTokens: 4096,   // 最大输出
-		SessionID:       sessionID,
 		SystemPrompt:    "你是一个客服助手。",
 		RPCDoc:          "订单号格式为 ORD-123，金额单位为元。", // JSON-RPC 文档
-		ContextParams:   map[string]any{"user_id": "u_42", "token": "..."}, // 身份等上下文，不会发给模型
-		Store:           store,
-		Billing:         agent.Pricing{Input: 100, Output: 1000, CacheRead: 10}, // 每百万 token 的积分
 		Methods: []agent.Method{
 			// NewMethod 从 GetOrderParams 自动生成参数说明，并自动解码 + 校验 params
 			agent.NewMethod("get_order", func(ctx context.Context, call *agent.Call, p GetOrderParams) (any, error) {
@@ -111,6 +101,17 @@ func main() {
 				RequireConfirm: true, // 需要确认才执行
 			}),
 		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 2. 创建会话，拿到 session id（可附带 metadata，比如所属用户）
+	sessionID, _ := client.CreateSession(ctx, map[string]any{"user_id": "u_42"})
+
+	// 3. 为这个会话创建 agent，只传和本次请求有关的参数
+	a, err := client.Agent(ctx, sessionID, agent.AgentOptions{
+		ContextParams: map[string]any{"user_id": "u_42", "token": "..."}, // 身份等上下文，不会发给模型
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -149,17 +150,37 @@ OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=sk-... MODEL=gpt-4o-min
 
 ## 概念与 API
 
-### 全局初始化与会话
+### Client：全局初始化与会话
+
+所有操作都从 `*agent.Client` 发起。它在启动时创建一次，全进程共享，并保存 `Store` 等全局配置，所以后续方法都不需要再传存储层。每个方法第一个参数是 `ctx`，这是 Go 的惯例：它代表这一次调用，用于取消和超时，不能存起来复用。
 
 ```go
-agent.Init(ctx, store)                                  // 建表 + 崩溃恢复，幂等，启动时调用
-agent.SchemaStatements(agent.Postgres)                  // 只要 DDL，交给自己的迁移工具
-sid, _ := agent.CreateSession(ctx, store, metadata)     // 创建会话，返回 session id
-s, _ := agent.GetSession(ctx, store, sid)               // 会话状态、last_error、metadata
-agent.ResetSession(ctx, store, sid)                     // 手动恢复单个会话（见“异常恢复”）
+client, err := agent.NewClient(ctx, agent.Config{...}) // 建表 + 崩溃恢复，幂等
+agent.SchemaStatements(agent.Postgres)                 // 只要 DDL，交给自己的迁移工具（配合 Config.SkipSchema）
+
+sid, _ := client.CreateSession(ctx, metadata)          // 创建会话，返回 session id
+s, _ := client.Session(ctx, sid)                       // 会话状态、last_error、metadata
+client.Stop(ctx, sid)                                  // 不创建 agent 也能停止会话（比如“停止”按钮的接口）
+client.PendingCalls(ctx, sid)                          // 待确认的 RPC 调用
+client.ResetSession(ctx, sid)                          // 手动恢复单个会话（见“异常恢复”）
+client.Recover(ctx)                                    // 重新执行一次启动时的崩溃恢复
 ```
 
-`agent.New` 的 `Config.SessionID` 为空时会自动创建新会话，用 `a.SessionID()` 取回。
+`Config` 里的大模型配置（`BaseURL`、`Model` 等）只在创建 agent 时需要。只用来查消息、做结算的服务，传一个 `Store` 就够了。
+
+### 创建 Agent
+
+```go
+a, err := client.Agent(ctx, sid, agent.AgentOptions{
+	ContextParams: map[string]any{"user_id": uid}, // 本次请求的身份，传给 RPC handler
+	Override: func(cfg *agent.Config) {            // 可选：只对这个 agent 修改配置
+		cfg.SystemPrompt = "你是退款专员。"
+		cfg.Model = "gpt-4o"
+	},
+})
+```
+
+`sid` 为空时会自动创建新会话，用 `a.SessionID()` 取回。创建 agent 很轻量，每个请求新建一个即可。
 
 ### Agent 执行方法
 
@@ -172,7 +193,7 @@ agent.ResetSession(ctx, store, sid)                     // 手动恢复单个会
 | `a.Confirm(ctx, decisions...)` | 批准 / 拒绝待确认的 RPC 调用，全部处理完后继续 loop |
 | `a.Status(ctx)` | `idle` / `running` / `stopping` / `waiting_confirmation` |
 | `a.PendingCalls(ctx)` | 待确认的 RPC 调用列表 |
-| `a.Usage(ctx)` | 会话累计 token 与积分 |
+| `a.Session(ctx)` / `a.SessionID()` / `a.Client()` | 会话信息 / 会话 ID / 所属 Client |
 
 一次运行（`Chat` / `Continue` / `Confirm`）会在以下情况返回，`RunResult.StopReason` 说明原因：
 
@@ -183,9 +204,9 @@ agent.ResetSession(ctx, store, sid)                     // 手动恢复单个会
 
 `Chat` 会阻塞到本次运行结束，Web 服务里一般放到 goroutine 中执行，前端轮询数据库获取进度（见“流式输出与前端轮询”）。`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
 
-**状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行期间后台每几秒心跳一次（流式输出和长时间的 RPC 调用中也会），超过 `Config.StaleAfter`（默认 1 分钟）没有心跳的会话可被其他运行接管。进程重启时由 `Init` 统一恢复，见“异常恢复”。
+**状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行期间后台每几秒心跳一次（流式输出和长时间的 RPC 调用中也会），超过 `Config.StaleAfter`（默认 1 分钟）没有心跳的会话可被其他运行接管。进程重启时由 `NewClient` 统一恢复，见“异常恢复”。
 
-典型 Web 服务用法：一个请求里 `go a.Chat(...)`，另一个请求用同一个 session id `agent.New(...)` 后调 `Stop` / `Status` / `PendingCalls` / `Confirm`。
+典型 Web 服务用法：一个请求里 `go a.Chat(...)`，另一个请求用同一个 session id `client.Agent(...)` 后调 `Confirm`，或者直接 `client.Stop(ctx, sid)` / `client.Session(ctx, sid)` / `client.PendingCalls(ctx, sid)`。
 
 ### Stop
 
@@ -322,18 +343,18 @@ Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 
 ### 上下文参数（身份验证）
 
-`Config.ContextParams` 用于传递当前请求的身份信息，handler 通过 `call.Value("user_id")` 或 `call.ContextParams` 读取。它**不会**发给模型，也**不会**持久化，每次 `agent.New` 时由调用方传入当前用户的值即可——确认流程中由另一个请求来 `Confirm` 时，handler 拿到的是那次请求传入的上下文参数。
+`AgentOptions.ContextParams` 用于传递当前请求的身份信息，handler 通过 `call.Value("user_id")` 或 `call.ContextParams` 读取。它**不会**发给模型，也**不会**持久化，每次 `client.Agent` 时由调用方传入当前用户的值即可——确认流程中由另一个请求来 `Confirm` 时，handler 拿到的是那次请求传入的上下文参数。
 
 ### 消息查询
 
 ```go
-agent.LatestMessages(ctx, store, sid, 20)            // 最新 20 条（按时间正序）
-agent.MessagesBefore(ctx, store, sid, msgID, 20)     // msgID 之前的 20 条（向上翻页）
-agent.MessagesAfter(ctx, store, sid, msgID, 20)      // msgID 之后的 20 条
-// Agent 上也有同名便捷方法：a.LatestMessages(ctx, 20) ...
+client.LatestMessages(ctx, sid, 20)           // 最新 20 条（按时间正序）
+client.MessagesBefore(ctx, sid, msgID, 20)    // msgID 之前的 20 条（向上翻页）
+client.MessagesAfter(ctx, sid, msgID, 20)     // msgID 之后的 20 条
+client.Message(ctx, sid, msgID)               // 单条
 ```
 
-`Message` 字段：`ID`、`Seq`（会话内递增序号）、`Role`、`Status`、`Content`（提取出的文本）、`Reasoning`（思考过程文本）、`ToolCalls`、`ToolCallID`、`Raw`（完整原始 JSON）、`CreatedAt`、`UpdatedAt`。另有 `agent.GetMessage(ctx, store, sid, msgID)` 查单条。
+`Message` 字段：`ID`、`Seq`（会话内递增序号）、`Role`、`Status`、`Content`（提取出的文本）、`Reasoning`（思考过程文本）、`ToolCalls`、`ToolCallID`、`Raw`（完整原始 JSON）、`CreatedAt`、`UpdatedAt`。
 
 ### 流式输出与前端轮询
 
@@ -357,9 +378,9 @@ cursor := "" // 最后一条已定稿消息的 ID
 for {
 	var ms []agent.Message
 	if cursor == "" {
-		ms, _ = agent.LatestMessages(ctx, store, sid, 5)
+		ms, _ = client.LatestMessages(ctx, sid, 5)
 	} else {
-		ms, _ = agent.MessagesAfter(ctx, store, sid, cursor, 50)
+		ms, _ = client.MessagesAfter(ctx, sid, cursor, 50)
 	}
 	render(ms) // 按 ID 覆盖渲染
 	for _, m := range ms {
@@ -368,7 +389,7 @@ for {
 		}
 		cursor = m.ID
 	}
-	s, _ := agent.GetSession(ctx, store, sid)
+	s, _ := client.Session(ctx, sid)
 	if s.Status != agent.StatusRunning { /* 空闲或等待确认 */ }
 	time.Sleep(time.Second)
 }
@@ -378,7 +399,7 @@ for {
 
 ### 异常恢复
 
-`agent.Init` 启动时会恢复上次进程留下的会话（状态为 `running` 的会话）：
+`agent.NewClient` 启动时会恢复上次进程留下的会话（状态为 `running` / `stopping` 的会话）：
 
 | 崩溃时所处阶段 | 恢复后 |
 | --- | --- |
@@ -391,13 +412,17 @@ for {
 
 恢复后历史是完整合法的，直接 `Chat` / `Continue` 即可，模型能看到哪些调用失败了。被打断的助手消息如果一个字都没有，不会发给模型。
 
-**多实例部署**：默认 `Init` 会恢复**所有** `running` 的会话，适合单实例。多个进程共用一个数据库时，要只恢复真正没有心跳的会话，避免重启一个实例时误伤其他实例正在跑的会话：
+**多实例部署**：默认会恢复**所有** `running` 的会话，适合单实例。多个进程共用一个数据库时，要只恢复真正没有心跳的会话，避免重启一个实例时误伤其他实例正在跑的会话：
 
 ```go
-agent.Init(ctx, store, agent.RecoverStaleAfter(2*time.Minute)) // 需大于 Config.StaleAfter
+agent.NewClient(ctx, agent.Config{
+	Store:             store,
+	RecoverStaleAfter: 2 * time.Minute, // 需大于 Config.StaleAfter
+	// ...
+})
 ```
 
-另外，每次运行开始时也会自动修复该会话的残留状态（接管无心跳的会话时同样适用），所以即使没有重新调用 `Init`，也不会出现历史不完整的情况。
+另外，每次运行开始时也会自动修复该会话的残留状态（接管无心跳的会话时同样适用），所以即使进程没有重启，也不会出现历史不完整的情况。
 
 ### Token 记录与计费
 
@@ -422,8 +447,8 @@ type Billing interface { Cost(model string, usage agent.Usage) agent.Cost }
 查询：
 
 ```go
-recs, _ := agent.ListUsage(ctx, store, sid)       // 每次调用明细
-sum, _ := agent.SessionUsage(ctx, store, sid)     // 累计汇总（含已结算）
+recs, _ := client.ListUsage(ctx, sid)   // 每次调用明细
+sum, _ := client.Usage(ctx, sid)        // 累计汇总（含已结算）
 ```
 
 #### 结算（扣积分）
@@ -433,7 +458,7 @@ sum, _ := agent.SessionUsage(ctx, store, sid)     // 累计汇总（含已结算
 **推荐：`SettleUsage` 一步结算**，并发安全，不会重复扣费：
 
 ```go
-bill, err := agent.SettleUsage(ctx, store, sid, func(ctx context.Context, b *agent.Bill) error {
+bill, err := client.SettleUsage(ctx, sid, func(ctx context.Context, b *agent.Bill) error {
 	// b.Summary.Cost.Total 为本次要扣的积分，b.Records 为明细
 	// 用 b.ID 作为幂等键写入你的账本
 	return wallet.Deduct(ctx, userID, b.Summary.Cost.Total, b.ID)
@@ -445,17 +470,17 @@ bill, err := agent.SettleUsage(ctx, store, sid, func(ctx context.Context, b *age
 
 - `charge` 返回 `nil` → 记录标记为已结算；
 - `charge` 返回错误（如余额不足）→ 记录释放回未结算，下次再结算，错误原样返回；
-- 进程在 `charge` 期间崩溃 → 记录保持“已认领”，在 `UnbilledUsage` 里能看到 `BillID`。去账本查这个 ID，已扣则 `agent.CompleteBill(ctx, store, billID)`，未扣则 `agent.ReleaseBill(ctx, store, billID)`。
+- 进程在 `charge` 期间崩溃 → 记录保持“已认领”，在 `UnbilledUsage` 里能看到 `BillID`。去账本查这个 ID，已扣则 `client.CompleteBill(ctx, billID)`，未扣则 `client.ReleaseBill(ctx, billID)`。
 
 **也可以手动查询 + 标记**：
 
 ```go
-sum, recs, _ := agent.UnbilledUsage(ctx, store, sid)  // 未结算的汇总和明细；sid 传 "" 表示所有会话
+sum, recs, _ := client.UnbilledUsage(ctx, sid)  // 未结算的汇总和明细；sid 传 "" 表示所有会话
 // ... 自己扣费 ...
-agent.MarkBilled(ctx, store, "你的账单号", recordIDs...) // 已结算的记录不会被重复标记
+client.MarkBilled(ctx, "你的账单号", recordIDs...)  // 已结算的记录不会被重复标记
 ```
 
-Agent 上也有便捷方法 `a.UnbilledUsage(ctx)`、`a.SettleUsage(ctx, charge)`。需要实时处理的话，还可以用 `Config.OnUsage` 回调，每次 LLM 调用记账后触发。
+需要实时处理的话，还可以用 `Config.OnUsage` 回调，每次 LLM 调用记账后触发。
 
 注意：被 Stop 打断或出错的流式请求，服务商通常不会返回 usage，这部分消耗无法记录。
 
@@ -493,6 +518,8 @@ type Store interface {
 
 | 字段 | 说明 |
 | --- | --- |
+| `SkipSchema` | `NewClient` 不建表（自己用 `SchemaStatements` 做迁移） |
+| `RecoverStaleAfter` | `NewClient` 只恢复超过这个时长没有心跳的会话，多实例部署时使用；0 表示恢复全部 |
 | `StreamFlushInterval` | 流式输出时写库的间隔，默认 2 秒 |
 | `StreamIdleTimeout` | 流式输出多久没有数据就中断，默认 2 分钟，负数关闭 |
 | `KeepReasoning` | 把思考内容以 `reasoning_content` 回传给模型（DeepSeek 思考模式 + 工具调用需要）。无论开不开，思考内容都会存进 `Message.Reasoning` |

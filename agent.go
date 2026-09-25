@@ -11,8 +11,29 @@ import (
 	"time"
 )
 
-// Config configures an Agent.
+// Config is the client-wide configuration shared by every agent created from
+// a Client. Per-session values (session id, context params) are passed to
+// Client.Agent; AgentOptions.Override can adjust a copy of this config for a
+// single agent.
 type Config struct {
+	// Store persists sessions, messages, rpc calls and usage. Required.
+	Store Store
+	// Billing prices every LLM call in credits. Optional.
+	Billing Billing
+
+	// SkipSchema makes NewClient skip creating tables (use SchemaStatements
+	// with your own migration tool instead).
+	SkipSchema bool
+	// RecoverStaleAfter limits the crash recovery done by NewClient to
+	// sessions without a heartbeat for this long. 0 recovers every running
+	// session, which is right for a single process. With several processes
+	// sharing one database, set it above StaleAfter so a restarting instance
+	// does not reset runs that are alive elsewhere.
+	RecoverStaleAfter time.Duration
+
+	// The fields below configure agents; BaseURL and Model are required only
+	// when creating an agent.
+
 	// OpenAI-compatible endpoint, e.g. "https://api.openai.com/v1".
 	// "/chat/completions" is appended unless already present.
 	BaseURL string
@@ -30,8 +51,6 @@ type Config struct {
 	// (required by some newer OpenAI models).
 	UseMaxCompletionTokens bool
 
-	// SessionID resumes an existing session. Empty creates a new one.
-	SessionID string
 	// SystemPrompt is prepended to every request. Keep it stable across calls
 	// so the provider prefix cache keeps hitting.
 	SystemPrompt string
@@ -40,15 +59,6 @@ type Config struct {
 	RPCDoc string
 	// Methods are the RPC methods the model may call.
 	Methods []Method
-	// ContextParams are passed to every handler through Call.ContextParams
-	// (e.g. user id, tenant, auth token). They are not sent to the model and
-	// not persisted.
-	ContextParams map[string]any
-
-	// Store persists sessions, messages, rpc calls and usage. Required.
-	Store Store
-	// Billing prices every LLM call in credits. Optional.
-	Billing Billing
 
 	// StreamFlushInterval is how often a streaming assistant message is
 	// written to the store (default 2s). The message row is created on the
@@ -92,28 +102,36 @@ type Config struct {
 	OnUsage func(ctx context.Context, r UsageRecord)
 }
 
-// Agent runs the tool-calling loop for one session. It is safe for concurrent
-// use; at most one run per session executes at a time (across processes too,
-// through the session row lock).
+// Agent runs the tool-calling loop for one session. Create it with
+// Client.Agent. It is safe for concurrent use; at most one run per session
+// executes at a time (across processes too, through the session row lock).
 type Agent struct {
-	cfg       Config
-	store     Store
-	llm       *llmClient
-	methods   map[string]Method
-	system    json.RawMessage
-	tools     []json.RawMessage
-	sessionID string
+	client        *Client
+	cfg           Config
+	store         Store
+	llm           *llmClient
+	methods       map[string]Method
+	system        json.RawMessage
+	tools         []json.RawMessage
+	sessionID     string
+	contextParams map[string]any
 }
 
-// New creates an agent bound to cfg.SessionID, creating a new session when it
-// is empty.
-func New(ctx context.Context, cfg Config) (*Agent, error) {
-	if cfg.Store == nil {
-		return nil, errors.New("agent: Config.Store is required")
-	}
-	if cfg.BaseURL == "" || cfg.Model == "" {
-		return nil, errors.New("agent: Config.BaseURL and Config.Model are required")
-	}
+// AgentOptions are the per-agent inputs of Client.Agent.
+type AgentOptions struct {
+	// ContextParams are passed to every RPC handler through
+	// Call.ContextParams (e.g. the authenticated user, tenant, token). They
+	// are not sent to the model and not persisted; pass the current request's
+	// values every time you build an agent.
+	ContextParams map[string]any
+	// Override adjusts a copy of the client config for this agent only, e.g.
+	// a different system prompt, model or method set. Changing Store has no
+	// effect.
+	Override func(cfg *Config)
+}
+
+// withDefaults fills in zero values.
+func (cfg Config) withDefaults() Config {
 	if cfg.ToolName == "" {
 		cfg.ToolName = "json_rpc"
 	}
@@ -136,14 +154,30 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	} else if cfg.StreamIdleTimeout < 0 {
 		cfg.StreamIdleTimeout = 0
 	}
+	return cfg
+}
+
+func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOptions) (*Agent, error) {
+	cfg := c.cfg
+	cfg.Methods = append([]Method(nil), c.cfg.Methods...)
+	if opts.Override != nil {
+		opts.Override(&cfg)
+	}
+	cfg.Store = c.store
+	cfg = cfg.withDefaults()
+	if cfg.BaseURL == "" || cfg.Model == "" {
+		return nil, errors.New("agent: Config.BaseURL and Config.Model are required to create an agent")
+	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{} // no overall timeout: streams can be long; see StreamIdleTimeout
 	}
 	a := &Agent{
-		cfg:     cfg,
-		store:   cfg.Store,
-		methods: make(map[string]Method, len(cfg.Methods)),
+		client:        c,
+		cfg:           cfg,
+		store:         c.store,
+		methods:       make(map[string]Method, len(cfg.Methods)),
+		contextParams: opts.ContextParams,
 		llm: &llmClient{
 			endpoint:    chatEndpoint(cfg.BaseURL),
 			apiKey:      cfg.APIKey,
@@ -181,25 +215,28 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		a.tools = []json.RawMessage{tool}
 	}
 
-	if cfg.SessionID == "" {
-		if a.sessionID, err = CreateSession(ctx, a.store, nil); err != nil {
+	if sessionID == "" {
+		if a.sessionID, err = createSession(ctx, a.store, nil); err != nil {
 			return nil, err
 		}
 	} else {
-		if _, err := GetSession(ctx, a.store, cfg.SessionID); err != nil {
+		if _, err := getSession(ctx, a.store, sessionID); err != nil {
 			return nil, err
 		}
-		a.sessionID = cfg.SessionID
+		a.sessionID = sessionID
 	}
 	return a, nil
 }
+
+// Client returns the client this agent was created from.
+func (a *Agent) Client() *Client { return a.client }
 
 // SessionID returns the id of the session this agent drives.
 func (a *Agent) SessionID() string { return a.sessionID }
 
 // Session loads the session row.
 func (a *Agent) Session(ctx context.Context) (*Session, error) {
-	return GetSession(ctx, a.store, a.sessionID)
+	return getSession(ctx, a.store, a.sessionID)
 }
 
 // Status returns the current session status.
@@ -213,42 +250,7 @@ func (a *Agent) Status(ctx context.Context) (Status, error) {
 
 // PendingCalls returns the RPC calls waiting for confirmation.
 func (a *Agent) PendingCalls(ctx context.Context) ([]RPCCall, error) {
-	return PendingCalls(ctx, a.store, a.sessionID)
-}
-
-// LatestMessages returns the newest limit messages of the session.
-func (a *Agent) LatestMessages(ctx context.Context, limit int) ([]Message, error) {
-	return LatestMessages(ctx, a.store, a.sessionID, limit)
-}
-
-// MessagesBefore returns up to limit messages older than messageID.
-func (a *Agent) MessagesBefore(ctx context.Context, messageID string, limit int) ([]Message, error) {
-	return MessagesBefore(ctx, a.store, a.sessionID, messageID, limit)
-}
-
-// MessagesAfter returns up to limit messages newer than messageID.
-func (a *Agent) MessagesAfter(ctx context.Context, messageID string, limit int) ([]Message, error) {
-	return MessagesAfter(ctx, a.store, a.sessionID, messageID, limit)
-}
-
-// GetMessage loads one message of the session.
-func (a *Agent) GetMessage(ctx context.Context, messageID string) (*Message, error) {
-	return GetMessage(ctx, a.store, a.sessionID, messageID)
-}
-
-// Usage sums token usage and credits of the session.
-func (a *Agent) Usage(ctx context.Context) (*UsageSummary, error) {
-	return SessionUsage(ctx, a.store, a.sessionID)
-}
-
-// UnbilledUsage returns the session's LLM calls not marked billed yet.
-func (a *Agent) UnbilledUsage(ctx context.Context) (*UsageSummary, []UsageRecord, error) {
-	return UnbilledUsage(ctx, a.store, a.sessionID)
-}
-
-// SettleUsage bills the session's unbilled LLM calls; see the package-level SettleUsage.
-func (a *Agent) SettleUsage(ctx context.Context, charge func(ctx context.Context, bill *Bill) error) (*Bill, error) {
-	return SettleUsage(ctx, a.store, a.sessionID, charge)
+	return pendingCalls(ctx, a.store, a.sessionID)
 }
 
 // Chat appends a user message and runs the agent loop until the model answers
@@ -306,7 +308,7 @@ func (a *Agent) Confirm(ctx context.Context, decisions ...Decision) (*RunResult,
 		return nil, errors.New("agent: no decisions")
 	}
 	return a.run(ctx, []Status{StatusWaitingConfirmation}, func(ctx context.Context, st *runState) error {
-		pending, err := PendingCalls(st.db, a.store, a.sessionID)
+		pending, err := pendingCalls(st.db, a.store, a.sessionID)
 		if err != nil {
 			return err
 		}
@@ -356,7 +358,7 @@ func (a *Agent) Confirm(ctx context.Context, decisions ...Decision) (*RunResult,
 // the session still finishes stopping on its own.
 func (a *Agent) Stop(ctx context.Context) error {
 	for {
-		s, err := GetSession(ctx, a.store, a.sessionID)
+		s, err := getSession(ctx, a.store, a.sessionID)
 		if err != nil {
 			return err
 		}
@@ -516,7 +518,7 @@ func (a *Agent) heal(ctx context.Context, st *runState) error {
 	if err := recoverSessionData(st.db, a.store, a.sessionID); err != nil {
 		return err
 	}
-	last, err := LatestMessages(st.db, a.store, a.sessionID, 1)
+	last, err := latestMessages(st.db, a.store, a.sessionID, 1)
 	if err != nil {
 		return err
 	}
@@ -551,7 +553,7 @@ func (a *Agent) reconcileCalls(ctx context.Context, st *runState) error {
 			}
 			continue
 		}
-		if _, err := GetMessage(st.db, a.store, a.sessionID, c.ResultMessageID); errors.Is(err, ErrMessageNotFound) {
+		if _, err := getMessage(st.db, a.store, a.sessionID, c.ResultMessageID); errors.Is(err, ErrMessageNotFound) {
 			m := a.toolMessage(c)
 			m.ID = c.ResultMessageID
 			if err := a.insertMessage(ctx, st, &m); err != nil {
@@ -593,7 +595,7 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 		}
 		bookErr = errors.Join(bookErr, oerr)
 	}
-	pending, perr := PendingCalls(st.db, a.store, a.sessionID)
+	pending, perr := pendingCalls(st.db, a.store, a.sessionID)
 	bookErr = errors.Join(bookErr, perr)
 	status := StatusIdle
 	if len(pending) > 0 {
@@ -651,7 +653,7 @@ func (a *Agent) acquire(ctx context.Context, from []Status) (string, error) {
 	if owner == runID {
 		return runID, nil
 	}
-	s, err := GetSession(ctx, a.store, a.sessionID)
+	s, err := getSession(ctx, a.store, a.sessionID)
 	if err != nil {
 		return "", err
 	}
@@ -915,7 +917,7 @@ func (a *Agent) notify(ctx context.Context, st *runState, messageID string) {
 	if a.cfg.OnMessage == nil {
 		return
 	}
-	if m, err := GetMessage(st.db, a.store, a.sessionID, messageID); err == nil {
+	if m, err := getMessage(st.db, a.store, a.sessionID, messageID); err == nil {
 		a.cfg.OnMessage(ctx, *m)
 	}
 }

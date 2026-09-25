@@ -31,9 +31,9 @@ func rawOrNil(s string) json.RawMessage {
 
 // ---- sessions ----
 
-// CreateSession creates a new idle session and returns its id. metadata is
+// createSession creates a new idle session and returns its id. metadata is
 // optional and stored as JSON (e.g. the owning user id).
-func CreateSession(ctx context.Context, store Store, metadata map[string]any) (string, error) {
+func createSession(ctx context.Context, store Store, metadata map[string]any) (string, error) {
 	meta := []byte("{}")
 	if metadata != nil {
 		var err error
@@ -52,8 +52,8 @@ func CreateSession(ctx context.Context, store Store, metadata map[string]any) (s
 	return id, nil
 }
 
-// GetSession loads a session.
-func GetSession(ctx context.Context, store Store, id string) (*Session, error) {
+// getSession loads a session.
+func getSession(ctx context.Context, store Store, id string) (*Session, error) {
 	rows, err := store.Query(ctx, "SELECT id, status, last_error, metadata, created_at, updated_at FROM agent_sessions WHERE id = ?", id)
 	if err != nil {
 		return nil, err
@@ -192,8 +192,8 @@ func updateMessage(ctx context.Context, store Store, m *Message) error {
 	return nil
 }
 
-// GetMessage loads one message, e.g. to poll a message that is still streaming.
-func GetMessage(ctx context.Context, store Store, sessionID, messageID string) (*Message, error) {
+// getMessage loads one message, e.g. to poll a message that is still streaming.
+func getMessage(ctx context.Context, store Store, sessionID, messageID string) (*Message, error) {
 	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND id = ?", sessionID, messageID)
 	if err != nil {
 		return nil, err
@@ -251,8 +251,8 @@ func reverse(ms []Message) []Message {
 	return ms
 }
 
-// LatestMessages returns the newest limit messages in chronological order.
-func LatestMessages(ctx context.Context, store Store, sessionID string, limit int) ([]Message, error) {
+// latestMessages returns the newest limit messages in chronological order.
+func latestMessages(ctx context.Context, store Store, sessionID string, limit int) ([]Message, error) {
 	rows, err := store.Query(ctx, fmt.Sprintf("SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? ORDER BY seq DESC LIMIT %d", normLimit(limit)), sessionID)
 	if err != nil {
 		return nil, err
@@ -261,9 +261,9 @@ func LatestMessages(ctx context.Context, store Store, sessionID string, limit in
 	return reverse(ms), err
 }
 
-// MessagesBefore returns up to limit messages older than messageID, in
+// messagesBefore returns up to limit messages older than messageID, in
 // chronological order (for scrolling back through history).
-func MessagesBefore(ctx context.Context, store Store, sessionID, messageID string, limit int) ([]Message, error) {
+func messagesBefore(ctx context.Context, store Store, sessionID, messageID string, limit int) ([]Message, error) {
 	seq, err := messageSeq(ctx, store, sessionID, messageID)
 	if err != nil {
 		return nil, err
@@ -276,9 +276,9 @@ func MessagesBefore(ctx context.Context, store Store, sessionID, messageID strin
 	return reverse(ms), err
 }
 
-// MessagesAfter returns up to limit messages newer than messageID, in
+// messagesAfter returns up to limit messages newer than messageID, in
 // chronological order.
-func MessagesAfter(ctx context.Context, store Store, sessionID, messageID string, limit int) ([]Message, error) {
+func messagesAfter(ctx context.Context, store Store, sessionID, messageID string, limit int) ([]Message, error) {
 	seq, err := messageSeq(ctx, store, sessionID, messageID)
 	if err != nil {
 		return nil, err
@@ -413,8 +413,8 @@ func callsForMessage(ctx context.Context, store Store, messageID string) ([]RPCC
 	return scanCalls(rows)
 }
 
-// PendingCalls returns the RPC calls of a session waiting for confirmation.
-func PendingCalls(ctx context.Context, store Store, sessionID string) ([]RPCCall, error) {
+// pendingCalls returns the RPC calls of a session waiting for confirmation.
+func pendingCalls(ctx context.Context, store Store, sessionID string) ([]RPCCall, error) {
 	rows, err := store.Query(ctx, "SELECT "+callCols+" FROM agent_rpc_calls WHERE session_id = ? AND status = ? ORDER BY created_at ASC, call_index ASC",
 		sessionID, string(CallAwaitingConfirmation))
 	if err != nil {
@@ -475,13 +475,13 @@ func queryUsage(ctx context.Context, store Store, where string, args ...any) ([]
 	return out, rows.Err()
 }
 
-// ListUsage returns every LLM call of a session, oldest first.
-func ListUsage(ctx context.Context, store Store, sessionID string) ([]UsageRecord, error) {
+// listUsage returns every LLM call of a session, oldest first.
+func listUsage(ctx context.Context, store Store, sessionID string) ([]UsageRecord, error) {
 	return queryUsage(ctx, store, "session_id = ?", sessionID)
 }
 
-// SessionUsage sums token usage and credits over all LLM calls of a session.
-func SessionUsage(ctx context.Context, store Store, sessionID string) (*UsageSummary, error) {
+// sessionUsage sums token usage and credits over all LLM calls of a session.
+func sessionUsage(ctx context.Context, store Store, sessionID string) (*UsageSummary, error) {
 	rows, err := store.Query(ctx, `SELECT COUNT(*),
 		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0),
 		COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(reasoning_tokens), 0),

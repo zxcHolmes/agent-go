@@ -76,7 +76,7 @@ func TestTypedHandler(t *testing.T) {
 }
 
 func TestInvoke(t *testing.T) {
-	a := &Agent{cfg: Config{ContextParams: map[string]any{"user": "u1"}}, methods: map[string]Method{
+	a := &Agent{contextParams: map[string]any{"user": "u1"}, methods: map[string]Method{
 		"whoami": {Name: "whoami", Handler: func(ctx context.Context, c *Call) (any, error) {
 			cc, _ := CallFromContext(ctx)
 			return map[string]any{"user": cc.Value("user")}, nil

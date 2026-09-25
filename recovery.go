@@ -6,52 +6,25 @@ import (
 	"time"
 )
 
-// InitOption configures Init.
-type InitOption func(*initOptions)
-
-type initOptions struct {
-	staleAfter time.Duration
-	noRecovery bool
-}
-
-// RecoverStaleAfter limits crash recovery to sessions whose run has not sent a
-// heartbeat for d. Use it when several processes share one database, so a
-// restarting instance does not reset runs that are alive on other instances
-// (runs heartbeat every few seconds; see Config.StaleAfter).
-func RecoverStaleAfter(d time.Duration) InitOption {
-	return func(o *initOptions) { o.staleAfter = d }
-}
-
-// WithoutRecovery makes Init only create tables.
-func WithoutRecovery() InitOption {
-	return func(o *initOptions) { o.noRecovery = true }
-}
-
-// Init creates the SDK tables if they do not exist and recovers sessions left
-// "running" or "stopping" by a previous process (crash, kill, deploy). Call it once at
-// startup; it is idempotent.
-//
-// By default every running session is considered dead, which is right when a
-// single process uses the database. With several processes, pass
-// RecoverStaleAfter. See ResetSession for what recovery does.
-func Init(ctx context.Context, store Store, opts ...InitOption) error {
-	var o initOptions
-	for _, fn := range opts {
-		fn(&o)
-	}
+// migrate creates the SDK tables if they do not exist.
+func migrate(ctx context.Context, store Store) error {
 	for _, stmt := range SchemaStatements(store.Dialect()) {
 		if _, err := store.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("agent: init schema: %w", err)
 		}
 	}
-	if o.noRecovery {
-		return nil
-	}
+	return nil
+}
+
+// recoverCrashed resets sessions left "running" or "stopping" by a dead
+// process. staleAfter > 0 limits it to sessions without a heartbeat for that
+// long.
+func recoverCrashed(ctx context.Context, store Store, staleAfter time.Duration) error {
 	q := "SELECT id FROM agent_sessions WHERE status IN (?, ?)"
 	args := []any{string(StatusRunning), string(StatusStopping)}
-	if o.staleAfter > 0 {
+	if staleAfter > 0 {
 		q += " AND updated_at < ?"
-		args = append(args, nowMillis()-o.staleAfter.Milliseconds())
+		args = append(args, nowMillis()-staleAfter.Milliseconds())
 	}
 	rows, err := store.Query(ctx, q, args...)
 	if err != nil {
@@ -71,7 +44,7 @@ func Init(ctx context.Context, store Store, opts ...InitOption) error {
 		return err
 	}
 	for _, id := range ids {
-		if err := ResetSession(ctx, store, id); err != nil {
+		if err := resetSession(ctx, store, id); err != nil {
 			return fmt.Errorf("agent: recover session %s: %w", id, err)
 		}
 	}
@@ -80,7 +53,7 @@ func Init(ctx context.Context, store Store, opts ...InitOption) error {
 
 const crashNote = "recovered: the process stopped while this session was running"
 
-// ResetSession recovers a session whose run died with its process:
+// resetSession recovers a session whose run died with its process:
 //   - assistant messages still "streaming" become "interrupted" (partial
 //     content is kept and stays in the history);
 //   - RPC calls that were running become "failed" with a CodeCrashed error
@@ -91,17 +64,16 @@ const crashNote = "recovered: the process stopped while this session was running
 //   - the session becomes idle, or waiting_confirmation if calls still await
 //     approval, and last_error records the recovery.
 //
-// Init calls it for every crashed session. Only call it directly when you know
-// no run is active for the session.
-func ResetSession(ctx context.Context, store Store, id string) error {
-	s, err := GetSession(ctx, store, id)
+// NewClient runs it for every crashed session.
+func resetSession(ctx context.Context, store Store, id string) error {
+	s, err := getSession(ctx, store, id)
 	if err != nil {
 		return err
 	}
 	if err := recoverSessionData(ctx, store, id); err != nil {
 		return err
 	}
-	pending, err := PendingCalls(ctx, store, id)
+	pending, err := pendingCalls(ctx, store, id)
 	if err != nil {
 		return err
 	}

@@ -126,9 +126,10 @@ func toolCall(id, method, params string) string {
 func text(s string) string { return fmt.Sprintf(`{"role":"assistant","content":%q}`, s) }
 
 type env struct {
-	store agent.Store
-	llm   *fakeLLM
-	cfg   agent.Config
+	store  agent.Store
+	client *agent.Client
+	llm    *fakeLLM
+	cfg    agent.Config // tests tweak it before newAgent
 }
 
 type orderParams struct {
@@ -151,32 +152,35 @@ func setup(t *testing.T, methods ...agent.Method) *env {
 	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { db.Close() })
 	store := agent.NewSQLStore(db, agent.SQLite)
-	ctx := context.Background()
-	if err := agent.Init(ctx, store); err != nil {
-		t.Fatal(err)
-	}
-	if err := agent.Init(ctx, store); err != nil { // idempotent
-		t.Fatal(err)
-	}
 	f := &fakeLLM{hung: make(chan struct{}, 4)}
 	srv := httptest.NewServer(http.HandlerFunc(f.handler))
 	t.Cleanup(srv.Close)
 	methods = append(methods, agent.NewMethod("get_order", func(ctx context.Context, c *agent.Call, p orderParams) (any, error) {
 		return map[string]any{"order_id": p.OrderID, "user": c.Value("user_id")}, nil
 	}, agent.MethodDoc{Description: "Get an order"}))
-	return &env{store: store, llm: f, cfg: agent.Config{
+	cfg := agent.Config{
+		Store: store, Billing: agent.Pricing{Input: 100, Output: 1000, CacheRead: 10},
 		BaseURL: srv.URL + "/v1", APIKey: "k", Model: "fake", ContextLength: 100000, MaxOutputTokens: 1000,
-		SystemPrompt: "sys", RPCDoc: "docs", ContextParams: map[string]any{"user_id": "u1"},
-		Store: store, Billing: agent.Pricing{Input: 100, Output: 1000, CacheRead: 10}, Methods: methods,
+		SystemPrompt: "sys", RPCDoc: "docs", Methods: methods,
 		StaleAfter: time.Second, MaxRetries: -1,
-	}}
+	}
+	ctx := context.Background()
+	client, err := agent.NewClient(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.NewClient(ctx, cfg); err != nil { // init is idempotent
+		t.Fatal(err)
+	}
+	return &env{store: store, client: client, llm: f, cfg: cfg}
 }
 
 func (e *env) newAgent(t *testing.T, sessionID string) *agent.Agent {
 	t.Helper()
-	cfg := e.cfg
-	cfg.SessionID = sessionID
-	a, err := agent.New(context.Background(), cfg)
+	a, err := e.client.Agent(context.Background(), sessionID, agent.AgentOptions{
+		ContextParams: map[string]any{"user_id": "u1"},
+		Override:      func(cfg *agent.Config) { *cfg = e.cfg },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +218,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func TestChatToolLoop(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
-	sid, err := agent.CreateSession(ctx, e.store, map[string]any{"owner": "u1"})
+	sid, err := e.client.CreateSession(ctx, map[string]any{"owner": "u1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +264,7 @@ func TestChatToolLoop(t *testing.T) {
 	}
 
 	// Usage & billing: 3 calls x (200 uncached in, 800 cached, 100 out).
-	sum, err := a.Usage(ctx)
+	sum, err := e.client.Usage(ctx, a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,13 +274,13 @@ func TestChatToolLoop(t *testing.T) {
 	}
 
 	// Cursor pagination.
-	all, _ := a.LatestMessages(ctx, 100)
-	latest, _ := a.LatestMessages(ctx, 2)
+	all, _ := e.client.LatestMessages(ctx, a.SessionID(), 100)
+	latest, _ := e.client.LatestMessages(ctx, a.SessionID(), 2)
 	if len(all) != 6 || roles(latest) != "tool,assistant" || latest[1].ID != all[5].ID {
 		t.Fatalf("latest %s", roles(latest))
 	}
-	before, _ := a.MessagesBefore(ctx, all[3].ID, 2)
-	after, _ := a.MessagesAfter(ctx, all[3].ID, 10)
+	before, _ := e.client.MessagesBefore(ctx, a.SessionID(), all[3].ID, 2)
+	after, _ := e.client.MessagesAfter(ctx, a.SessionID(), all[3].ID, 10)
 	if len(before) != 2 || before[0].ID != all[1].ID || len(after) != 2 || after[0].ID != all[4].ID {
 		t.Fatal("before/after")
 	}
@@ -316,7 +320,7 @@ func TestStreamingFlush(t *testing.T) {
 	// Poll like a frontend would: cursor = the user message, fetch everything after it.
 	var user agent.Message
 	waitFor(t, "user message", func() bool {
-		ms, _ := a.LatestMessages(ctx, 5)
+		ms, _ := e.client.LatestMessages(ctx, a.SessionID(), 5)
 		for _, m := range ms {
 			if m.Role == "user" {
 				user = m
@@ -327,7 +331,7 @@ func TestStreamingFlush(t *testing.T) {
 	})
 	var seen []string
 	waitFor(t, "stream to finish", func() bool {
-		ms, _ := a.MessagesAfter(ctx, user.ID, 10)
+		ms, _ := e.client.MessagesAfter(ctx, a.SessionID(), user.ID, 10)
 		if len(ms) == 0 {
 			return false
 		}
@@ -388,7 +392,7 @@ func TestConfirmation(t *testing.T) {
 	if err != nil || res.Reply() != "Refunded." || len(refunded) != 1 || res.Status != agent.StatusIdle {
 		t.Fatalf("%+v %v %v", res, err, refunded)
 	}
-	all, _ := a.LatestMessages(ctx, 10)
+	all, _ := e.client.LatestMessages(ctx, a.SessionID(), 10)
 	if got := statuses(all); got != "done,done,done,done" || !strings.Contains(all[2].Content, `"result":"ok"`) {
 		t.Fatalf("%s %s", got, all[2].Content)
 	}
@@ -399,7 +403,7 @@ func TestConfirmation(t *testing.T) {
 	if _, err = a.Confirm(ctx, agent.Reject(res.PendingCalls[0].ID, "too large")); err != nil || len(refunded) != 1 {
 		t.Fatal(err, refunded)
 	}
-	all, _ = a.LatestMessages(ctx, 2)
+	all, _ = e.client.LatestMessages(ctx, a.SessionID(), 2)
 	if c := all[0].Content; !strings.Contains(c, `"code":-32001`) || !strings.Contains(c, "too large") {
 		t.Fatalf("rejection: %s", c)
 	}
@@ -434,7 +438,7 @@ func TestStopAndContinue(t *testing.T) {
 		done <- res
 	}()
 	<-started
-	ms, _ := a.LatestMessages(ctx, 10)
+	ms, _ := e.client.LatestMessages(ctx, a.SessionID(), 10)
 	if got := statuses(ms); got != "done,done,running,pending" {
 		t.Fatalf("while running: %s", got)
 	}
@@ -457,7 +461,7 @@ func TestStopAndContinue(t *testing.T) {
 	if res.StopReason != agent.StopStopped || res.Status != agent.StatusIdle {
 		t.Fatalf("%+v", res)
 	}
-	all, _ := a.LatestMessages(ctx, 100)
+	all, _ := e.client.LatestMessages(ctx, a.SessionID(), 100)
 	if roles(all) != "user,assistant,tool,tool" || statuses(all) != "done,done,done,done" {
 		t.Fatal(roles(all), statuses(all))
 	}
@@ -468,7 +472,7 @@ func TestStopAndContinue(t *testing.T) {
 	// The abandoned handler finishing later changes nothing.
 	close(release)
 	time.Sleep(50 * time.Millisecond)
-	after, _ := a.LatestMessages(ctx, 100)
+	after, _ := e.client.LatestMessages(ctx, a.SessionID(), 100)
 	if after[2].Content != all[2].Content {
 		t.Fatal("late handler result overwrote the stop result")
 	}
@@ -495,12 +499,12 @@ func TestStopWhileWaitingConfirmation(t *testing.T) {
 	if res, err := a.Chat(ctx, "refund"); err != nil || res.Status != agent.StatusWaitingConfirmation {
 		t.Fatal(res, err)
 	}
-	if err := a.Stop(ctx); err != nil {
+	if err := e.client.Stop(ctx, a.SessionID()); err != nil { // no Agent needed, e.g. a "stop" HTTP handler
 		t.Fatal(err)
 	}
 	s, _ := a.Session(ctx)
 	p, _ := a.PendingCalls(ctx)
-	ms, _ := a.LatestMessages(ctx, 1)
+	ms, _ := e.client.LatestMessages(ctx, a.SessionID(), 1)
 	if s.Status != agent.StatusIdle || len(p) != 0 || !strings.Contains(ms[0].Content, "stopped by user") || ms[0].Status != agent.MessageDone {
 		t.Fatalf("%+v %v %+v", s, p, ms[0])
 	}
@@ -621,7 +625,7 @@ func TestStopDeadRun(t *testing.T) {
 	if err := a.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	m, _ := a.GetMessage(ctx, "msg_dead")
+	m, _ := e.client.Message(ctx, a.SessionID(), "msg_dead")
 	if st, _ := a.Status(ctx); st != agent.StatusIdle || m.Status != agent.MessageInterrupted {
 		t.Fatalf("%s %s", st, m.Status)
 	}
@@ -635,36 +639,36 @@ func TestBillingSettlement(t *testing.T) {
 	if _, err := a.Chat(ctx, "hi"); err != nil {
 		t.Fatal(err)
 	}
-	sum, recs, err := a.UnbilledUsage(ctx)
+	sum, recs, err := e.client.UnbilledUsage(ctx, a.SessionID())
 	perCall := 200*100.0/1e6 + 800*10.0/1e6 + 100*1000.0/1e6
 	if err != nil || sum.Calls != 2 || len(recs) != 2 || abs(sum.Cost.Total-2*perCall) > 1e-9 {
 		t.Fatalf("%+v %v", sum, err)
 	}
 
 	// Charge fails: records go back to the pool.
-	if _, err := a.SettleUsage(ctx, func(ctx context.Context, b *agent.Bill) error { return errors.New("no balance") }); err == nil {
+	if _, err := e.client.SettleUsage(ctx, a.SessionID(), func(ctx context.Context, b *agent.Bill) error { return errors.New("no balance") }); err == nil {
 		t.Fatal("want error")
 	}
-	_, recs, _ = a.UnbilledUsage(ctx)
+	_, recs, _ = e.client.UnbilledUsage(ctx, a.SessionID())
 	if len(recs) != 2 || recs[0].BillID != "" {
 		t.Fatalf("not released: %+v", recs)
 	}
 
 	var charged float64
-	bill, err := a.SettleUsage(ctx, func(ctx context.Context, b *agent.Bill) error {
+	bill, err := e.client.SettleUsage(ctx, a.SessionID(), func(ctx context.Context, b *agent.Bill) error {
 		charged += b.Summary.Cost.Total
 		return nil
 	})
 	if err != nil || bill == nil || bill.Summary.Calls != 2 || abs(charged-2*perCall) > 1e-9 {
 		t.Fatalf("%+v %v", bill, err)
 	}
-	if sum, _, _ := a.UnbilledUsage(ctx); sum.Calls != 0 {
+	if sum, _, _ := e.client.UnbilledUsage(ctx, a.SessionID()); sum.Calls != 0 {
 		t.Fatal("still unbilled")
 	}
-	if b, err := a.SettleUsage(ctx, func(context.Context, *agent.Bill) error { t.Error("nothing to charge"); return nil }); b != nil || err != nil {
+	if b, err := e.client.SettleUsage(ctx, a.SessionID(), func(context.Context, *agent.Bill) error { t.Error("nothing to charge"); return nil }); b != nil || err != nil {
 		t.Fatal(b, err)
 	}
-	all, _ := agent.ListUsage(ctx, e.store, a.SessionID())
+	all, _ := e.client.ListUsage(ctx, a.SessionID())
 	if all[0].BillID != bill.ID || all[0].BilledAt == nil {
 		t.Fatalf("%+v", all[0])
 	}
@@ -683,7 +687,7 @@ func TestBillingSettlement(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := a.SettleUsage(ctx, func(ctx context.Context, b *agent.Bill) error {
+			_, err := e.client.SettleUsage(ctx, a.SessionID(), func(ctx context.Context, b *agent.Bill) error {
 				mu.Lock()
 				billedCalls += b.Summary.Calls
 				mu.Unlock()
@@ -702,14 +706,14 @@ func TestBillingSettlement(t *testing.T) {
 	// Manual marking.
 	e.llm.push(text("y"))
 	_, _ = a.Chat(ctx, "again")
-	_, recs, _ = agent.UnbilledUsage(ctx, e.store, "") // all sessions
+	_, recs, _ = e.client.UnbilledUsage(ctx, "") // all sessions
 	if len(recs) != 1 {
 		t.Fatal(len(recs))
 	}
-	if _, err := agent.MarkBilled(ctx, e.store, "ledger-42", recs[0].ID); err != nil {
+	if _, err := e.client.MarkBilled(ctx, "ledger-42", recs[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	if sum, _, _ := agent.UnbilledUsage(ctx, e.store, ""); sum.Calls != 0 {
+	if sum, _, _ := e.client.UnbilledUsage(ctx, ""); sum.Calls != 0 {
 		t.Fatal("MarkBilled did not mark")
 	}
 }
@@ -754,10 +758,10 @@ func TestStopDuringStream(t *testing.T) {
 	}
 }
 
-// simulateRestart runs Init on the same database, as a restarted process would.
+// simulateRestart creates a new client on the same database, as a restarted process would.
 func simulateRestart(t *testing.T, e *env) {
 	t.Helper()
-	if err := agent.Init(context.Background(), e.store); err != nil {
+	if _, err := agent.NewClient(context.Background(), e.cfg); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -787,7 +791,7 @@ func TestCrashDuringToolCall(t *testing.T) {
 	if s.Status != agent.StatusIdle || !strings.Contains(s.LastError, "recovered") {
 		t.Fatalf("session after recovery: %+v", s)
 	}
-	all, _ := a.LatestMessages(ctx, 10)
+	all, _ := e.client.LatestMessages(ctx, a.SessionID(), 10)
 	if statuses(all) != "done,done,done" || !strings.Contains(all[2].Content, `"code":-32003`) {
 		t.Fatalf("%s %s", statuses(all), all[2].Content)
 	}
@@ -795,7 +799,7 @@ func TestCrashDuringToolCall(t *testing.T) {
 	if err := <-done; !errors.Is(err, agent.ErrLockLost) {
 		t.Fatalf("want ErrLockLost, got %v", err)
 	}
-	all2, _ := a.LatestMessages(ctx, 10)
+	all2, _ := e.client.LatestMessages(ctx, a.SessionID(), 10)
 	if all2[2].Content != all[2].Content {
 		t.Fatal("zombie run overwrote the recovered result")
 	}
@@ -820,7 +824,7 @@ func TestCrashDuringStream(t *testing.T) {
 	}()
 	<-e.llm.hung
 	waitFor(t, "partial flush", func() bool {
-		ms, _ := a.LatestMessages(ctx, 1)
+		ms, _ := e.client.LatestMessages(ctx, a.SessionID(), 1)
 		return len(ms) == 1 && ms[0].Content == "partia"
 	})
 	if st, _ := a.Status(ctx); st != agent.StatusRunning {
@@ -831,7 +835,7 @@ func TestCrashDuringStream(t *testing.T) {
 	if st, _ := a.Status(ctx); st != agent.StatusIdle {
 		t.Fatalf("status after restart: %s", st)
 	}
-	ms, _ := a.LatestMessages(ctx, 1)
+	ms, _ := e.client.LatestMessages(ctx, a.SessionID(), 1)
 	if ms[0].Status != agent.MessageInterrupted || ms[0].Content != "partia" {
 		t.Fatalf("%+v", ms[0])
 	}
@@ -858,7 +862,9 @@ func TestRecoverStaleOnly(t *testing.T) {
 	}()
 	<-e.llm.hung
 	// A live run on "another instance" must survive a restart that only recovers stale sessions.
-	if err := agent.Init(ctx, e.store, agent.RecoverStaleAfter(time.Minute)); err != nil {
+	cfg := e.cfg
+	cfg.RecoverStaleAfter = time.Minute
+	if _, err := agent.NewClient(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := a.Status(ctx); st != agent.StatusRunning {
@@ -892,6 +898,48 @@ func TestLLMErrorAndContextLength(t *testing.T) {
 	small := e.newAgent(t, a.SessionID())
 	if _, err := small.Chat(ctx, strings.Repeat("x", 500)); !errors.Is(err, agent.ErrContextLengthExceeded) {
 		t.Fatalf("want ErrContextLengthExceeded, got %v", err)
+	}
+}
+
+func TestClientOverridesAndReadOnly(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	client, err := agent.NewClient(ctx, e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := client.Agent(ctx, "", agent.AgentOptions{Override: func(c *agent.Config) {
+		c.SystemPrompt = "you are a pirate"
+		c.Methods = nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.llm.push(text("arr"))
+	if _, err := a.Chat(ctx, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	msgs := e.llm.request(0)
+	if !strings.Contains(string(msgs[0]), "you are a pirate") || strings.Contains(string(msgs[0]), "get_order") {
+		t.Fatalf("override not applied: %s", msgs[0])
+	}
+	if _, ok := e.llm.requests[0]["tools"]; ok {
+		t.Fatal("no methods -> no tools")
+	}
+
+	// A client without LLM settings still serves reads and billing.
+	ro, err := agent.NewClient(ctx, agent.Config{Store: e.store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ms, err := ro.LatestMessages(ctx, a.SessionID(), 5); err != nil || len(ms) != 2 {
+		t.Fatal(ms, err)
+	}
+	if sum, _, err := ro.UnbilledUsage(ctx, a.SessionID()); err != nil || sum.Calls != 1 {
+		t.Fatal(sum, err)
+	}
+	if _, err := ro.Agent(ctx, "", agent.AgentOptions{}); err == nil {
+		t.Fatal("agent without BaseURL/Model must fail")
 	}
 }
 

@@ -24,10 +24,10 @@ func summarize(records []UsageRecord) UsageSummary {
 	return s
 }
 
-// UnbilledUsage returns the LLM calls not marked billed yet, oldest first, and
+// unbilledUsage returns the LLM calls not marked billed yet, oldest first, and
 // their total. sessionID "" means all sessions. Records claimed by a
-// SettleUsage that has not completed (BillID set, BilledAt nil) are included.
-func UnbilledUsage(ctx context.Context, store Store, sessionID string) (*UsageSummary, []UsageRecord, error) {
+// settleUsage that has not completed (BillID set, BilledAt nil) are included.
+func unbilledUsage(ctx context.Context, store Store, sessionID string) (*UsageSummary, []UsageRecord, error) {
 	where, args := "billed_at = 0", []any{}
 	if sessionID != "" {
 		where += " AND session_id = ?"
@@ -41,10 +41,10 @@ func UnbilledUsage(ctx context.Context, store Store, sessionID string) (*UsageSu
 	return &s, records, nil
 }
 
-// MarkBilled marks LLM call records as billed under billID (empty generates
+// markBilled marks LLM call records as billed under billID (empty generates
 // one) and returns the bill id. Records already billed are left unchanged, so
 // calling it twice is harmless.
-func MarkBilled(ctx context.Context, store Store, billID string, recordIDs ...string) (string, error) {
+func markBilled(ctx context.Context, store Store, billID string, recordIDs ...string) (string, error) {
 	if billID == "" {
 		billID = newID("bill")
 	}
@@ -61,7 +61,7 @@ func MarkBilled(ctx context.Context, store Store, billID string, recordIDs ...st
 	return billID, err
 }
 
-// SettleUsage bills every unbilled LLM call of a session in one step, safely
+// settleUsage bills every unbilled LLM call of a session in one step, safely
 // against concurrent settlements:
 //
 //  1. it atomically claims the session's unclaimed, unbilled records under a
@@ -75,7 +75,7 @@ func MarkBilled(ctx context.Context, store Store, billID string, recordIDs ...st
 // If the process dies during charge, the records stay claimed (BillID set,
 // BilledAt nil, visible in UnbilledUsage): check your ledger for Bill.ID, then
 // call CompleteBill or ReleaseBill.
-func SettleUsage(ctx context.Context, store Store, sessionID string, charge func(ctx context.Context, bill *Bill) error) (*Bill, error) {
+func settleUsage(ctx context.Context, store Store, sessionID string, charge func(ctx context.Context, bill *Bill) error) (*Bill, error) {
 	if sessionID == "" {
 		return nil, fmt.Errorf("agent: SettleUsage needs a session id")
 	}
@@ -86,7 +86,7 @@ func SettleUsage(ctx context.Context, store Store, sessionID string, charge func
 	}
 	records, err := queryUsage(ctx, store, "bill_id = ?", billID)
 	if err != nil {
-		_ = ReleaseBill(context.WithoutCancel(ctx), store, billID)
+		_ = releaseBill(context.WithoutCancel(ctx), store, billID)
 		return nil, err
 	}
 	if len(records) == 0 {
@@ -94,26 +94,26 @@ func SettleUsage(ctx context.Context, store Store, sessionID string, charge func
 	}
 	bill := &Bill{ID: billID, SessionID: sessionID, Records: records, Summary: summarize(records)}
 	if err := charge(ctx, bill); err != nil {
-		if rerr := ReleaseBill(context.WithoutCancel(ctx), store, billID); rerr != nil {
+		if rerr := releaseBill(context.WithoutCancel(ctx), store, billID); rerr != nil {
 			return nil, fmt.Errorf("%w (and releasing bill %s failed: %v)", err, billID, rerr)
 		}
 		return nil, err
 	}
-	if err := CompleteBill(context.WithoutCancel(ctx), store, billID); err != nil {
+	if err := completeBill(context.WithoutCancel(ctx), store, billID); err != nil {
 		return bill, fmt.Errorf("agent: charged bill %s but marking it billed failed: %w", billID, err)
 	}
 	return bill, nil
 }
 
-// CompleteBill marks all records claimed under billID as billed.
-func CompleteBill(ctx context.Context, store Store, billID string) error {
+// completeBill marks all records claimed under billID as billed.
+func completeBill(ctx context.Context, store Store, billID string) error {
 	_, err := store.Exec(ctx, "UPDATE agent_llm_calls SET billed_at = ? WHERE bill_id = ? AND billed_at = 0", nowMillis(), billID)
 	return err
 }
 
-// ReleaseBill returns records claimed under billID but not billed to the
+// releaseBill returns records claimed under billID but not billed to the
 // unbilled pool, so the next SettleUsage picks them up again.
-func ReleaseBill(ctx context.Context, store Store, billID string) error {
+func releaseBill(ctx context.Context, store Store, billID string) error {
 	_, err := store.Exec(ctx, "UPDATE agent_llm_calls SET bill_id = '', claimed_at = 0 WHERE bill_id = ? AND billed_at = 0", billID)
 	return err
 }
