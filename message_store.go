@@ -137,12 +137,26 @@ func getMessage(ctx context.Context, store Store, sessionID, messageID string) (
 	return &ms[0], nil
 }
 
-func allMessages(ctx context.Context, store Store, sessionID string) ([]Message, error) {
-	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? ORDER BY seq ASC", sessionID)
+// messagesFromSeq returns the messages with seq >= from, oldest first.
+func messagesFromSeq(ctx context.Context, store Store, sessionID string, from int64) ([]Message, error) {
+	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND seq >= ? ORDER BY seq ASC", sessionID, from)
 	if err != nil {
 		return nil, err
 	}
 	return scanMessages(rows)
+}
+
+// latestCompaction returns the newest compaction message, if any.
+func latestCompaction(ctx context.Context, store Store, sessionID string) (*Message, error) {
+	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND kind = ? ORDER BY seq DESC LIMIT 1", sessionID, MessageKindCompaction)
+	if err != nil {
+		return nil, err
+	}
+	ms, err := scanMessages(rows)
+	if err != nil || len(ms) == 0 {
+		return nil, err
+	}
+	return &ms[0], nil
 }
 
 // lastAssistant returns the newest assistant message, if any.

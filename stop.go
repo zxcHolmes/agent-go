@@ -23,6 +23,7 @@ import (
 // and cleaned up by Stop itself. If ctx ends first, Stop returns its error;
 // the session still finishes stopping on its own.
 func (a *Agent) Stop(ctx context.Context) error {
+	a.log.Info("stop requested", "session", a.sessionID)
 	for {
 		s, err := getSession(ctx, a.store, a.sessionID)
 		if err != nil {

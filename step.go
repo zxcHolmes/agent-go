@@ -42,8 +42,11 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	if _, err := a.drainQueue(ctx, st); err != nil {
 		return false, err
 	}
-	history, maxTokens, err := a.prepareContext(ctx, st)
+	history, maxTokens, est, err := a.prepareContext(ctx, st)
 	if err != nil {
+		return false, err
+	}
+	if err := a.beforeLLMCall(ctx, "chat", est, maxTokens); err != nil {
 		return false, err
 	}
 	msgs := make([]json.RawMessage, 0, len(history)+1)
@@ -53,7 +56,12 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	for _, m := range history {
 		msgs = append(msgs, m.Raw)
 	}
+	if a.cfg.CacheControl {
+		msgs = withCacheControl(msgs)
+	}
 	req := chatRequest{Model: a.cfg.Model, Messages: msgs, Tools: a.tools}
+	a.log.Debug("llm request", "session", a.sessionID, "model", a.cfg.Model, "messages", len(msgs),
+		"estimated_prompt_tokens", est, "max_tokens", maxTokens)
 	if a.cfg.UseMaxCompletionTokens {
 		req.MaxCompletionTokens = maxTokens
 	} else {
@@ -123,6 +131,9 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	start := time.Now()
 	res, err := a.llm.stream(ctx, req, a.cfg.ExtraBody, onDelta)
 	endStream()
+	if err != nil && ctx.Err() == nil {
+		a.log.Warn("llm request failed", "session", a.sessionID, "error", err)
+	}
 	mu.Lock() // pairs with a timer callback that may have just run
 	defer mu.Unlock()
 	if err != nil {
@@ -159,6 +170,9 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 		return false, err
 	}
 	st.res.FinishReason = res.FinishReason
+	a.log.Debug("llm response", "session", a.sessionID, "finish_reason", res.FinishReason, "tool_calls", len(res.ToolCalls),
+		"prompt_tokens", usage.PromptTokens, "cached_tokens", usage.CachedTokens, "completion_tokens", usage.CompletionTokens,
+		"latency_ms", latency)
 	calls := make([]RPCCall, 0, len(msg.ToolCalls))
 	for i, tc := range msg.ToolCalls {
 		c := a.newCall(msg, i, tc)
@@ -201,4 +215,51 @@ func (a *Agent) recordUsage(ctx context.Context, st *runState, rec *UsageRecord)
 		a.cfg.OnUsage(ctx, *rec)
 	}
 	return nil
+}
+
+var ephemeral = json.RawMessage(`{"type":"ephemeral"}`)
+
+// withCacheControl returns the request messages with Anthropic-style cache
+// breakpoints on the system prompt and on the last message (the rolling
+// breakpoint). Only the request copy changes; stored messages stay as they are.
+func withCacheControl(msgs []json.RawMessage) []json.RawMessage {
+	out := append([]json.RawMessage(nil), msgs...)
+	if len(out) > 0 {
+		out[0] = addCacheControl(out[0])
+	}
+	if len(out) > 1 {
+		out[len(out)-1] = addCacheControl(out[len(out)-1])
+	}
+	return out
+}
+
+// addCacheControl marks the last content part of a message, turning string
+// content into a single text part. Messages without text content (e.g. an
+// assistant turn that only calls tools) are returned unchanged.
+func addCacheControl(raw json.RawMessage) json.RawMessage {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return raw
+	}
+	var parts []map[string]json.RawMessage
+	var s string
+	switch {
+	case json.Unmarshal(m["content"], &s) == nil && s != "":
+		text, _ := marshalJSON(s)
+		parts = []map[string]json.RawMessage{{"type": json.RawMessage(`"text"`), "text": text}}
+	case json.Unmarshal(m["content"], &parts) == nil && len(parts) > 0:
+	default:
+		return raw
+	}
+	parts[len(parts)-1]["cache_control"] = ephemeral
+	content, err := marshalJSON(parts)
+	if err != nil {
+		return raw
+	}
+	m["content"] = content
+	out, err := marshalJSON(m)
+	if err != nil {
+		return raw
+	}
+	return out
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 
 	agent "github.com/zxcHolmes/agent-go"
@@ -151,5 +152,54 @@ func TestCompactionNoProgressAndOff(t *testing.T) {
 	}
 	if n := len(e2.llm.request(1)); n != 4 { // system, a, A, b: nothing dropped
 		t.Fatalf("off mode dropped messages: %d", n)
+	}
+}
+
+// recordingStore records the start seq of every "messages from seq" query.
+type recordingStore struct {
+	agent.Store
+	mu    sync.Mutex
+	froms []int64
+}
+
+func (s *recordingStore) Query(ctx context.Context, q string, args ...any) (agent.Rows, error) {
+	if strings.Contains(q, "seq >= ?") {
+		s.mu.Lock()
+		s.froms = append(s.froms, args[1].(int64))
+		s.mu.Unlock()
+	}
+	return s.Store.Query(ctx, q, args...)
+}
+
+// After a compaction, a step reads only from the compaction point on.
+func TestWindowLoadsFromCompactionPoint(t *testing.T) {
+	e := setup(t)
+	rs := &recordingStore{Store: e.store}
+	e.cfg.Store = rs
+	e.cfg.ContextLength = 10000
+	client, err := agent.NewClient(context.Background(), e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := client.Agent(context.Background(), "", agent.AgentOptions{})
+	e.llm.pushReply(reply{msg: text("A"), hangAfter: -1, prompt: 8500})
+	e.llm.push(text("B"))
+	for _, p := range []string{"a", "b"} {
+		if _, err := a.Chat(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, _ := client.LatestMessages(context.Background(), a.SessionID(), 100)
+	var refSeq int64
+	for _, m := range all {
+		if m.Kind == agent.MessageKindCompaction {
+			refSeq = m.RefSeq
+		}
+	}
+	rs.mu.Lock()
+	last := rs.froms[len(rs.froms)-1]
+	rs.mu.Unlock()
+	if refSeq == 0 || last != refSeq {
+		t.Fatalf("last window query started at seq %d, compaction point is %d", last, refSeq)
 	}
 }

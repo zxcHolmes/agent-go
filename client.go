@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 )
 
@@ -14,6 +15,7 @@ type Client struct {
 	cfg   Config
 	store Store
 	res   *resources // mounted docs and the system prompt file
+	log   *slog.Logger
 }
 
 // NewClient validates cfg, creates the tables (unless cfg.SkipSchema) and
@@ -27,7 +29,7 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &Client{cfg: cfg, store: cfg.Store, res: res}
+	c := &Client{cfg: cfg, store: cfg.Store, res: res, log: newLogger(cfg)}
 	if !cfg.SkipSchema {
 		if err := migrate(ctx, c.store); err != nil {
 			return nil, err
@@ -42,7 +44,11 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 // Recover resets sessions left "running" or "stopping" by a dead process, as
 // NewClient does at startup. Each recovered session goes through ResetSession.
 func (c *Client) Recover(ctx context.Context) error {
-	return recoverCrashed(ctx, c.store, c.cfg.RecoverStaleAfter)
+	ids, err := recoverCrashed(ctx, c.store, c.cfg.RecoverStaleAfter)
+	for _, id := range ids {
+		c.log.Info("recovered session left running by a dead process", "session", id)
+	}
+	return err
 }
 
 // Agent returns an agent for sessionID, creating a new session when it is
@@ -87,7 +93,7 @@ func (c *Client) ResetSession(ctx context.Context, sessionID string) error {
 // Stop stops a session without building a full agent; see Agent.Stop.
 func (c *Client) Stop(ctx context.Context, sessionID string) error {
 	cfg := c.cfg.withDefaults()
-	a := &Agent{client: c, cfg: cfg, store: c.store, sessionID: sessionID, methods: map[string]Method{}}
+	a := &Agent{client: c, cfg: cfg, store: c.store, sessionID: sessionID, methods: map[string]Method{}, res: c.res, log: c.log}
 	for _, m := range cfg.Methods {
 		a.methods[m.Name] = m
 	}

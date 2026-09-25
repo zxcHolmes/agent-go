@@ -240,7 +240,7 @@ idle ──Chat/Continue──▶ running ──完成──▶ idle
 | `Stop` 与运行自然结束同时发生 | 如果运行结束时发现状态已是 `stopping`，按停止处理；如果运行抢先变成 `waiting_confirmation`，`Stop` 会接着取消待确认调用。最终都是 `idle` |
 | `Stop` 返回后立刻 `Chat` | 可以，不会 `ErrBusy` |
 | `stopping` 期间调用 `Chat` | 返回 `ErrBusy` |
-| 另一个进程调用 `Stop` | 运行方每 500ms 检查一次状态，约半秒内停止 |
+| 另一个进程调用 `Stop` | 运行方每隔 `StopPollInterval`（默认 1 秒）读一次会话状态，约 1 秒内停止 |
 | 持有会话的进程已经挂了 | 超过 `StaleAfter` 没有心跳时，`Stop` 自己接管并清理（等同崩溃恢复），不会一直等 |
 | 传给 `Stop` 的 ctx 超时 | 返回 ctx 的错误，但停止流程仍会继续完成 |
 
@@ -337,8 +337,9 @@ Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 | 缺少 `method` | `-32600` |
 | 方法不存在（会附带可用方法列表） | `-32601` |
 | `agent.InvalidParams(...)` / `Bind` 失败 / `Validate` 失败 | `-32602` |
-| handler 返回普通 error 或 panic | `-32603`，message 为错误内容 |
+| handler 返回普通 error 或 panic | `-32603`。message 为错误内容；panic 时只给模型 panic 的值，完整堆栈写入日志 |
 | 用户拒绝确认 | `-32001` |
+| 超过超时时间（`Method.Timeout` / `Config.RPCTimeout`） | `-32004` |
 | 被 Stop（执行中或未执行）/ 进程重启时未执行 | `-32002` |
 | 执行过程中进程崩溃（可能已生效，也可能没有） | `-32003` |
 | 自定义 | `agent.NewRPCError(code, msg, data)` |
@@ -409,6 +410,10 @@ user       [{"type":"text","text":"[view_image result for call_x] https://cdn.ex
 - 只接受 `http` / `https` 的 URL。其他地址（`file://`、`data:` 等）会以 `{"ok":false,"error":...}` 返回给模型，不会生成图片消息。
 - 进程崩溃时如果图片消息还没写入，下次运行开始时会自动补上，不会重复。
 - **图片加载失败不会卡死会话**：服务商拉取不到图片时（URL 404、防盗链等），会以 400 拒绝整个请求。如果不处理，这条图片消息每次都会被重放，会话就永久失败了。SDK 检测到这种情况时，会把本轮还没成功发送的图片消息标记为 `excluded`（前端仍可展示，但不再发给模型），把对应的工具结果改写为 `{"ok":false,"error":"...could not load this image..."}`，然后自动重试。模型会知道图片打不开，对话照常继续。
+
+#### 超时
+
+默认**不设超时**。需要时可以设置全局的 `Config.RPCTimeout`，或者单独设置某个方法的 `Method.Timeout` / `MethodDoc.Timeout`。超时后 handler 的 ctx 会被取消，模型立即收到 `-32004` 错误（“timed out after 5s; the call may or may not have taken effect”），不会等待 handler 返回。不响应 ctx 的 handler 会在后台继续执行，但它的返回结果会被丢弃。
 
 ### 上下文参数（身份验证）
 
@@ -552,6 +557,27 @@ client.MarkBilled(ctx, "你的账单号", recordIDs...)  // 已结算的记录�
 
 需要实时处理的话，还可以用 `Config.OnUsage` 回调，每次 LLM 调用记账后触发。
 
+#### 预算控制（BeforeLLMCall）
+
+结算是事后的。为了防止一次长的工具调用循环把余额扣成负数，可以在**每次调用大模型之前**（包括压缩时的摘要调用）检查余额：
+
+```go
+agent.Config{
+	BeforeLLMCall: func(ctx context.Context, info agent.LLMCallInfo) error {
+		// info: SessionID、Model、Purpose（"chat" 或 "summary"）、EstimatedPromptTokens、MaxTokens，
+		// 以及 MaxCost：按计费规则计算的最坏情况花费（整个 prompt 按未缓存输入计，加上 MaxTokens 的输出）
+		if balance(ctx) < info.MaxCost.Total {
+			return ErrInsufficientCredits
+		}
+		return nil
+	},
+}
+```
+
+返回错误时这次请求不会发出，也不会产生任何花费。运行会结束，`Chat` 原样返回这个错误（可以用 `errors.Is` 判断），会话回到 `idle`，并把原因记在 `last_error` 里。
+
+实测：预算 1.0 积分、让模型无限循环调用工具，跑了 8 次调用、花费 0.66 后被拦下，没有超支。
+
 注意：被 Stop 打断或出错的流式请求，服务商通常不会返回 usage，这部分消耗无法记录。
 
 ### 上下文压缩
@@ -606,6 +632,8 @@ agent.Config{Reminder: "回答要简洁，金额一律用人民币。"}
 
 ### 前缀缓存
 
+- OpenAI、DeepSeek、Gemini 等服务商会**自动**缓存相同的前缀（通常要求 prompt 超过 1024 token），不需要额外设置。
+- **Claude 模型**（Anthropic 接口，或通过 OpenRouter 等网关调用）需要显式标记缓存断点。开启 `Config.CacheControl` 后，每次请求会在系统提示词和最后一条消息上加 `cache_control: {"type":"ephemeral"}`，最后一条消息上的断点随对话往后移动。这个标记只加在发出去的请求副本上，数据库里的消息不会被修改。实测对 OpenAI、Gemini 模型开启也不会报错；Claude 上的缓存效果还没有实测过（当前代理没有配置 Claude 模型）。
 - 每条消息保存完整原始 JSON（`raw` 列），请求时按原字节回放，不做改写或截断。
 - 系统提示词和工具定义是确定性生成的（方法按名称排序），请保持 `SystemPrompt`、`RPCDoc`、`Methods` 稳定。
 - 历史只在压缩时才会改变起点（见“上下文压缩”），两次压缩之间发给模型的前缀完全不变。
@@ -635,6 +663,28 @@ type Store interface {
 | `agent_queued_messages` | 运行中追加、还没发给模型的用户消息 |
 | `agent_rpc_calls` | 每次 RPC 调用：方法、参数、状态、确认、JSON-RPC 结果 |
 
+### 日志
+
+SDK 使用标准库的 `log/slog`：
+
+```go
+agent.Config{
+	Logger:   slog.New(slog.NewJSONHandler(os.Stdout, nil)), // 默认 slog.Default()
+	LogLevel: slog.LevelDebug,                               // 默认 Info
+}
+```
+
+- **Info**：运行开始和结束（状态、停止原因、耗时、token 数、积分）、上下文压缩、Stop、崩溃恢复、大模型请求重试和失败、RPC 超时、`BeforeLLMCall` 拒绝。
+- **Debug**：每次大模型请求（消息数、估算的 token、max_tokens）和响应（finish_reason、token、延迟）、每次 RPC 调用（方法、耗时、状态）、队列消息插入。
+- **Error**：RPC handler panic，附带完整堆栈。
+
+`LogLevel` 按 agent 生效（可以通过 `AgentOptions.Override` 单独调整），所以多个 agent 可以共用同一个 logger，各自使用不同的级别。每条日志都带 `component=agent-go` 和 `session`。
+
+### 性能说明
+
+- 每次调用大模型前，只读取**最近一次压缩点之后**的消息（两次带索引的查询），开销不会随会话总长度增长。
+- 运行中的会话会在后台每隔 `StopPollInterval`（默认 1 秒）读一次自己的会话行，用来发现其他进程发来的 Stop，另外每隔几秒更新一次心跳时间。同一进程内的 Stop 直接在内存中取消，不依赖轮询。单进程部署可以设为负数关闭轮询：其他进程发来的 Stop 会在下一步开始前生效。
+
 ### 其他配置
 
 | 字段 | 说明 |
@@ -655,6 +705,11 @@ type Store interface {
 | `MaxRetries` | 429 / 5xx / 网络错误重试次数，默认 2，负数关闭；已经开始输出后不再重试。代理在 HTTP 200 的流里返回的错误（如 `{"error":{"code":502}}`）也按其中的 code 判断是否重试 |
 | `MaxSteps` | 单次运行最多 LLM 调用次数，默认 50 |
 | `StaleAfter` | 运行锁心跳超时，默认 1 分钟 |
+| `StopPollInterval` | 检查其他进程发来的 Stop 的间隔，默认 1 秒，负数关闭 |
+| `RPCTimeout` | RPC 调用的默认超时时间，默认不超时 |
+| `BeforeLLMCall` | 每次调用大模型前的钩子，可用于预算控制 |
+| `CacheControl` | 为 Claude 模型添加 `cache_control` 缓存断点 |
+| `Logger` / `LogLevel` | 日志输出和级别，见“日志” |
 | `OnStream` | 每个流式文本片段的回调 |
 | `OnMessage` | 每次消息写库（插入、流式刷新、工具状态变化）后回调 |
 | `OnUsage` | 每次 LLM 调用记账后回调 |

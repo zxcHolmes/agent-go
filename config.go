@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -101,6 +102,39 @@ type Config struct {
 	// the text without it.
 	Reminder string
 
+	// RPCTimeout bounds how long one RPC call may run; Method.Timeout
+	// overrides it per method. When it expires the handler's ctx is cancelled
+	// and the model gets a CodeTimeout error right away (a handler that
+	// ignores ctx keeps running in the background; its result is discarded).
+	// 0 (default) means no timeout.
+	RPCTimeout time.Duration
+
+	// BeforeLLMCall is called before every LLM request, including summary
+	// calls made by compaction. Returning an error cancels the request and
+	// ends the run with that error (e.g. insufficient credits); nothing is
+	// spent. See LLMCallInfo.
+	BeforeLLMCall func(ctx context.Context, info LLMCallInfo) error
+
+	// CacheControl adds Anthropic-style prompt caching breakpoints
+	// ({"cache_control":{"type":"ephemeral"}}) to the system prompt and the
+	// last message of every request, as OpenRouter and Anthropic-compatible
+	// gateways expect for Claude models. Other providers cache prefixes
+	// automatically and do not need it. Stored messages are not modified.
+	CacheControl bool
+
+	// Logger receives the SDK's logs (default slog.Default()). LogLevel sets
+	// the minimum level for this agent: slog.LevelInfo (default) logs runs,
+	// compactions, stops, recoveries and errors; slog.LevelDebug adds every
+	// LLM request, tool call, queue drain and retry.
+	Logger   *slog.Logger
+	LogLevel slog.Level
+
+	// StopPollInterval is how often a running agent checks the store for a
+	// Stop issued by another process (default 1s). Stop in the same process
+	// is immediate regardless. Negative disables polling: cross-process
+	// stops are then noticed before the next step only.
+	StopPollInterval time.Duration
+
 	// MaxRPCResultChars caps the size (in characters) of what one RPC call
 	// returns to the model; longer results and error messages are cut with a
 	// note saying how much was dropped. 0 means no limit.
@@ -174,6 +208,9 @@ const (
 )
 
 func (cfg Config) withDefaults() Config {
+	if cfg.StopPollInterval == 0 {
+		cfg.StopPollInterval = time.Second
+	}
 	if cfg.DocPageChars <= 0 {
 		cfg.DocPageChars = 20000
 	}

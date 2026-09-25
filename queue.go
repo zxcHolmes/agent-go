@@ -139,6 +139,7 @@ func (a *Agent) drainQueue(ctx context.Context, st *runState) (int, error) {
 			return 0, err
 		}
 	}
+	a.log.Debug("queued messages added to the conversation", "session", a.sessionID, "count", len(qs))
 	return len(qs), nil
 }
 

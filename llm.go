@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ type llmClient struct {
 	http        *http.Client
 	maxRetries  int
 	idleTimeout time.Duration
+	log         *slog.Logger
 }
 
 type chatRequest struct {
@@ -83,6 +85,9 @@ func (c *llmClient) stream(ctx context.Context, req chatRequest, extra map[strin
 		lastErr = err
 		if !retry || ctx.Err() != nil {
 			break
+		}
+		if attempt < c.maxRetries && c.log != nil {
+			c.log.Info("llm request failed, retrying", "attempt", attempt+1, "error", err)
 		}
 	}
 	return nil, lastErr

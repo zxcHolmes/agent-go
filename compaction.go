@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -15,57 +16,71 @@ const defaultCompactionPrompt = "You are compacting a conversation between a use
 
 // prepareContext returns the messages to send and the output token budget,
 // compacting the history first when it has grown past the threshold.
-func (a *Agent) prepareContext(ctx context.Context, st *runState) ([]Message, int, error) {
+func (a *Agent) prepareContext(ctx context.Context, st *runState) (window []Message, budget, est int, err error) {
 	window, marker, err := a.contextWindow(st)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	est, err := a.estimateTokens(st, window, marker)
-	if err != nil {
-		return nil, 0, err
+	if est, err = a.estimateTokens(st, window, marker); err != nil {
+		return nil, 0, 0, err
 	}
 	if a.needsCompaction(est) {
+		before := est
 		compacted, err := a.compact(ctx, st, window, marker)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		if compacted {
 			if window, marker, err = a.contextWindow(st); err != nil {
-				return nil, 0, err
+				return nil, 0, 0, err
 			}
 			if est, err = a.estimateTokens(st, window, marker); err != nil {
-				return nil, 0, err
+				return nil, 0, 0, err
 			}
+			a.log.Info("context compacted", "session", a.sessionID, "mode", string(a.cfg.Compaction),
+				"restart_at_seq", marker.RefSeq, "estimated_tokens_before", before, "estimated_tokens_after", est)
+		} else {
+			a.log.Debug("compaction skipped: the current turn already starts the context", "session", a.sessionID, "estimated_tokens", est)
 		}
 	}
-	budget, err := a.outputBudget(est)
-	return window, budget, err
+	budget, err = a.outputBudget(est)
+	return window, budget, est, err
 }
+
+// rejectedError marks a BeforeLLMCall rejection so compaction does not
+// swallow it like an ordinary summary failure.
+type rejectedError struct{ err error }
+
+func (e *rejectedError) Error() string { return e.err.Error() }
+func (e *rejectedError) Unwrap() error { return e.err }
 
 // contextWindow returns the messages the model sees: everything from the
 // latest compaction's RefSeq on, preceded by its summary in summary mode.
 // It also returns that compaction message (nil if the session has none).
+//
+// Only the messages from that point on are read from the store (two indexed
+// queries), so the cost of a step does not grow with the session's history.
 func (a *Agent) contextWindow(st *runState) ([]Message, *Message, error) {
-	all, err := allMessages(st.db, a.store, a.sessionID)
+	marker, err := latestCompaction(st.db, a.store, a.sessionID)
 	if err != nil {
 		return nil, nil, err
 	}
-	var marker *Message
-	for i := len(all) - 1; i >= 0; i-- {
-		if all[i].Kind == MessageKindCompaction {
-			marker = &all[i]
-			break
-		}
+	var from int64
+	if marker != nil {
+		from = marker.RefSeq
 	}
-	window := make([]Message, 0, len(all))
+	msgs, err := messagesFromSeq(st.db, a.store, a.sessionID, from)
+	if err != nil {
+		return nil, nil, err
+	}
+	window := make([]Message, 0, len(msgs)+1)
 	if marker != nil && marker.Status == MessageDone { // a summary to send
 		window = append(window, *marker)
 	}
-	for _, m := range all {
-		if m.Kind == MessageKindCompaction || (marker != nil && m.Seq < marker.RefSeq) {
-			continue
+	for _, m := range msgs {
+		if m.Kind != MessageKindCompaction {
+			window = append(window, m)
 		}
-		window = append(window, m)
 	}
 	return replayable(window), marker, nil
 }
@@ -157,9 +172,14 @@ func (a *Agent) compact(ctx context.Context, st *runState, window []Message, mar
 	if a.cfg.Compaction == CompactionSummary {
 		summary, r, err := a.summarize(ctx, st, dropped, m.ID)
 		if err != nil {
+			var rej *rejectedError
+			if errors.As(err, &rej) {
+				return false, rej.err
+			}
 			if ctx.Err() != nil {
 				return false, err // stopped: leave the history as it was
 			}
+			a.log.Warn("summary failed, compacting without it", "session", a.sessionID, "error", err)
 			// Keep the conversation going without a summary rather than failing it.
 			note += " (summary failed: " + truncate(err.Error(), 200) + ")"
 		} else {
@@ -206,6 +226,9 @@ func (a *Agent) summarize(ctx context.Context, st *runState, dropped []Message, 
 		req.MaxCompletionTokens = maxTokens
 	} else {
 		req.MaxTokens = maxTokens
+	}
+	if err := a.beforeLLMCall(ctx, "summary", (len(system)+len(user))/3, maxTokens); err != nil {
+		return "", nil, &rejectedError{err}
 	}
 	start := time.Now()
 	res, err := a.llm.stream(ctx, req, a.cfg.ExtraBody, nil)

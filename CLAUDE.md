@@ -57,6 +57,9 @@ settlement. User-facing docs are in `README.md` (Chinese).
   lost the lock (`ErrLockLost`) must not write anything.
 - Crash safety relies on deterministic ids for derived rows (`msg_img_<call>`,
   `msg_<queueID>`) and on `heal()` at the start of every run.
+- A step reads only messages from the latest compaction point
+  (`latestCompaction` + `messagesFromSeq`); never load a whole session.
+- Every LLM request (chat and summary) goes through `beforeLLMCall` first.
 - After a compaction, the last LLM call's token count no longer describes the
   window (`estimateTokens` checks this); usage rows of summary calls point at the
   compaction message, not an assistant message.
@@ -78,6 +81,8 @@ settlement. User-facing docs are in `README.md` (Chinese).
 - `rpc.go` / `prompt.go` / `jsonschema.go` — Method/Call/Typed/NewMethod, JSON-RPC
   dispatch and result limit, system prompt + tool definition, struct-tag schemas.
 - `viewimage.go` — `view_image` tool and healing of unloadable image URLs.
+- `log.go` — slog wiring (per-agent level filter), `LLMCallInfo` and the
+  `BeforeLLMCall` hook. Info = lifecycle/errors, Debug = per request/call.
 - `docs.go` — mounted docs (`Config.Docs` fs.FS, frontmatter parser, `read_doc`
   paging) and `SystemPromptFile`; loaded once per Client into `resources`.
 - `llm.go` / `stream.go` — HTTP client with retries, SSE parsing/accumulation.

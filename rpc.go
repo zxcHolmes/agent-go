@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"time"
 )
 
 // JSON-RPC error codes returned to the model.
@@ -21,6 +22,7 @@ const (
 	CodeRejected       = -32001 // the user rejected a call that required confirmation
 	CodeCancelled      = -32002 // the run was stopped before the call executed
 	CodeCrashed        = -32003 // the process crashed while the call was running
+	CodeTimeout        = -32004 // the call exceeded its timeout
 )
 
 // Handler executes one RPC method. The returned value is JSON-encoded into the
@@ -49,7 +51,9 @@ type Method struct {
 	// RequireConfirm pauses the agent before running this method until the
 	// caller approves or rejects it with Agent.Confirm.
 	RequireConfirm bool
-	Handler        Handler
+	// Timeout overrides Config.RPCTimeout for this method (0 = inherit).
+	Timeout time.Duration
+	Handler Handler
 }
 
 // MethodDoc is the documentation part of a Method, used by NewMethod.
@@ -59,6 +63,7 @@ type MethodDoc struct {
 	Result         string
 	Examples       []string
 	RequireConfirm bool
+	Timeout        time.Duration
 }
 
 // NewMethod builds a Method from a typed function. Params are decoded and
@@ -73,6 +78,7 @@ func NewMethod[P any, R any](name string, fn func(ctx context.Context, call *Cal
 		Result:         doc.Result,
 		Examples:       doc.Examples,
 		RequireConfirm: doc.RequireConfirm,
+		Timeout:        doc.Timeout,
 		Handler:        Typed(fn),
 	}
 }
@@ -239,7 +245,10 @@ func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage)
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			resp = rpcErrorResponse(rec.RPCID, a.limitError(&RPCError{Code: CodeInternalError, Message: fmt.Sprintf("panic: %v", r), Data: string(debug.Stack())}))
+			// The stack goes to the log only: it is noise for the model and
+			// leaks implementation details.
+			a.log.Error("rpc handler panicked", "session", a.sessionID, "method", rec.Method, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			resp = rpcErrorResponse(rec.RPCID, a.limitError(&RPCError{Code: CodeInternalError, Message: fmt.Sprintf("internal error: the method crashed (%v)", r)}))
 		}
 	}()
 	result, err := m.Handler(context.WithValue(ctx, callKey{}, call), call)

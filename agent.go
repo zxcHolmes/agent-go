@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -23,6 +24,7 @@ type Agent struct {
 	sessionID     string
 	contextParams map[string]any
 	res           *resources
+	log           *slog.Logger
 }
 
 func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOptions) (*Agent, error) {
@@ -54,6 +56,7 @@ func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOption
 		methods:       make(map[string]Method, len(cfg.Methods)),
 		contextParams: opts.ContextParams,
 		res:           res,
+		log:           newLogger(cfg),
 		llm: &llmClient{
 			endpoint:    chatEndpoint(cfg.BaseURL),
 			apiKey:      cfg.APIKey,
@@ -61,6 +64,7 @@ func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOption
 			http:        httpClient,
 			maxRetries:  cfg.MaxRetries,
 			idleTimeout: cfg.StreamIdleTimeout,
+			log:         newLogger(cfg),
 		},
 	}
 	for _, m := range cfg.Methods {

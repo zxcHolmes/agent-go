@@ -20,6 +20,7 @@ type runState struct {
 	cancel   context.CancelCauseFunc
 	startSeq int64 // messages with a greater seq were produced by this run
 	res      *RunResult
+	start    time.Time
 }
 
 // run acquires the session and drives it. With loop=false it only heals the
@@ -35,7 +36,8 @@ func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Con
 	running.Store(a.sessionID, lr)
 	defer running.CompareAndDelete(a.sessionID, lr)
 
-	st := &runState{runID: runID, db: context.WithoutCancel(ctx), cancel: cancel, res: &RunResult{SessionID: a.sessionID}}
+	st := &runState{runID: runID, db: context.WithoutCancel(ctx), cancel: cancel, res: &RunResult{SessionID: a.sessionID}, start: time.Now()}
+	a.log.Info("run started", "session", a.sessionID, "run", runID)
 	hbDone := a.heartbeat(runCtx, st)
 	defer hbDone()
 
@@ -56,29 +58,31 @@ func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Con
 	return a.finish(runCtx, st, reason, err)
 }
 
-// heartbeat keeps the session lock fresh while the run is alive and watches
-// for Stop from other processes (status "stopping"), so a stop interrupts even
-// the middle of a stream or a long RPC call within ~500ms. The returned func
-// stops it and waits for it to exit.
+// heartbeat keeps the session lock fresh while the run is alive (a write
+// every StaleAfter/4, at most 5s) and, every Config.StopPollInterval, reads
+// the session row to notice a Stop issued by another process (status
+// "stopping") or a lost lock, so either interrupts even a long stream or RPC
+// call. The returned func stops it and waits for it to exit.
 func (a *Agent) heartbeat(ctx context.Context, st *runState) func() {
 	beatEvery := a.cfg.StaleAfter / 4
 	if beatEvery > 5*time.Second {
 		beatEvery = 5 * time.Second
 	}
-	pollEvery := 500 * time.Millisecond
-	if beatEvery < pollEvery {
-		pollEvery = beatEvery
+	poll := a.cfg.StopPollInterval // <0: no polling
+	tick := beatEvery
+	if poll > 0 && poll < tick {
+		tick = poll
 	}
-	if pollEvery < 50*time.Millisecond {
-		pollEvery = 50 * time.Millisecond
+	if tick < 50*time.Millisecond {
+		tick = 50 * time.Millisecond
 	}
 	quit := make(chan struct{})
 	exited := make(chan struct{})
 	go func() {
 		defer close(exited)
-		t := time.NewTicker(pollEvery)
+		t := time.NewTicker(tick)
 		defer t.Stop()
-		lastBeat := time.Now()
+		lastBeat, lastPoll := time.Now(), time.Now()
 		for {
 			select {
 			case <-quit:
@@ -89,12 +93,20 @@ func (a *Agent) heartbeat(ctx context.Context, st *runState) func() {
 			}
 			if time.Since(lastBeat) >= beatEvery {
 				lastBeat = time.Now()
-				_, _ = a.store.Exec(st.db, "UPDATE agent_sessions SET updated_at = ? WHERE id = ? AND run_id = ?", nowMillis(), a.sessionID, st.runID)
+				if _, err := a.store.Exec(st.db, "UPDATE agent_sessions SET updated_at = ? WHERE id = ? AND run_id = ?", nowMillis(), a.sessionID, st.runID); err != nil {
+					a.log.Warn("heartbeat failed", "session", a.sessionID, "error", err)
+				}
 			}
+			if poll <= 0 || time.Since(lastPoll) < poll {
+				continue
+			}
+			lastPoll = time.Now()
 			owner, status, err := a.sessionLock(st.db)
 			switch {
 			case err != nil:
+				a.log.Warn("stop poll failed", "session", a.sessionID, "error", err)
 			case owner != st.runID:
+				a.log.Warn("session taken over by another run; abandoning this one", "session", a.sessionID, "run", st.runID)
 				st.cancel(ErrLockLost)
 				return
 			case status == StatusStopping:
@@ -223,6 +235,14 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 		res.StopReason = StopWaitingConfirmation
 	default:
 		res.StopReason = reason
+	}
+	attrs := []any{"session", a.sessionID, "run", st.runID, "status", string(res.Status), "stop_reason", string(res.StopReason),
+		"duration_ms", time.Since(st.start).Milliseconds(), "prompt_tokens", res.Usage.PromptTokens,
+		"completion_tokens", res.Usage.CompletionTokens, "credits", res.Cost.Total}
+	if err != nil {
+		a.log.Warn("run finished with error", append(attrs, "error", err)...)
+	} else {
+		a.log.Info("run finished", attrs...)
 	}
 	return res, err
 }

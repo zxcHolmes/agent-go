@@ -19,7 +19,7 @@ func migrate(ctx context.Context, store Store) error {
 // recoverCrashed resets sessions left "running" or "stopping" by a dead
 // process. staleAfter > 0 limits it to sessions without a heartbeat for that
 // long.
-func recoverCrashed(ctx context.Context, store Store, staleAfter time.Duration) error {
+func recoverCrashed(ctx context.Context, store Store, staleAfter time.Duration) ([]string, error) {
 	q := "SELECT id FROM agent_sessions WHERE status IN (?, ?)"
 	args := []any{string(StatusRunning), string(StatusStopping)}
 	if staleAfter > 0 {
@@ -28,27 +28,27 @@ func recoverCrashed(ctx context.Context, store Store, staleAfter time.Duration) 
 	}
 	rows, err := store.Query(ctx, q, args...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		ids = append(ids, id)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	for _, id := range ids {
+	for i, id := range ids {
 		if err := resetSession(ctx, store, id); err != nil {
-			return fmt.Errorf("agent: recover session %s: %w", id, err)
+			return ids[:i], fmt.Errorf("agent: recover session %s: %w", id, err)
 		}
 	}
-	return nil
+	return ids, nil
 }
 
 const crashNote = "recovered: the process stopped while this session was running"

@@ -75,24 +75,42 @@ func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 		return err
 	}
 	a.notify(ctx, st, c.ResultMessageID)
+	timeout := a.cfg.RPCTimeout
+	if m, ok := a.methods[c.Method]; ok && m.Timeout > 0 {
+		timeout = m.Timeout
+	}
+	callCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	start := time.Now()
 	done := make(chan json.RawMessage, 1)
-	go func() { done <- a.invoke(ctx, c) }()
+	go func() { done <- a.invoke(callCtx, c) }()
 	status := CallDone
 	var result json.RawMessage
 	select {
 	case result = <-done:
-	case <-ctx.Done():
+	case <-callCtx.Done():
 		select {
 		case result = <-done: // finished at the same instant: keep the real result
 		default:
-			status = CallCancelled
-			rerr := errStoppedRunning
-			if !errors.Is(context.Cause(ctx), ErrStopped) {
-				rerr = &RPCError{Code: CodeCancelled, Message: "cancelled while this call was running (" + context.Cause(ctx).Error() + "); it may or may not have taken effect"}
+			switch {
+			case ctx.Err() == nil: // our timeout, not a stop
+				result = rpcErrorResponse(c.RPCID, &RPCError{Code: CodeTimeout,
+					Message: fmt.Sprintf("timed out after %s; the call may or may not have taken effect", timeout)})
+				a.log.Info("rpc call timed out", "session", a.sessionID, "method", c.Method, "timeout", timeout)
+			case errors.Is(context.Cause(ctx), ErrStopped):
+				status, result = CallCancelled, rpcErrorResponse(c.RPCID, errStoppedRunning)
+			default:
+				status, result = CallCancelled, rpcErrorResponse(c.RPCID, &RPCError{Code: CodeCancelled,
+					Message: "cancelled while this call was running (" + context.Cause(ctx).Error() + "); it may or may not have taken effect"})
 			}
-			result = rpcErrorResponse(c.RPCID, rerr)
 		}
 	}
+	a.log.Debug("rpc call", "session", a.sessionID, "method", c.Method, "duration_ms", time.Since(start).Milliseconds(),
+		"status", string(status), "result_bytes", len(result))
 	if err := a.ownsLock(st); err != nil {
 		return err // the session was recovered meanwhile; do not overwrite it
 	}

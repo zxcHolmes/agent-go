@@ -44,6 +44,7 @@ func tableDefs(text string) []tableDef {
 				"updated_at BIGINT NOT NULL",
 				"UNIQUE (session_id, seq)",
 			},
+			indexes: [][2]string{{"idx_agent_messages_kind", "session_id, kind, seq"}},
 		},
 		{
 			name: "agent_llm_calls",
