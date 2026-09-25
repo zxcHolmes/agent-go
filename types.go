@@ -166,6 +166,27 @@ type RPCCall struct {
 	ResultMessageID string          `json:"result_message_id,omitempty"` // the tool message carrying Result
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`
+
+	started time.Time // when this process started the handler
+}
+
+// ToolCallPhase tells which moment of a call a ToolCallEvent reports.
+type ToolCallPhase string
+
+const (
+	ToolCallStart ToolCallPhase = "start" // the handler is about to run
+	ToolCallEnd   ToolCallPhase = "end"   // the call has its final result
+)
+
+// ToolCallEvent is passed to Config.OnToolCall.
+type ToolCallEvent struct {
+	Phase ToolCallPhase
+	// Call is the call's state at that moment; at ToolCallEnd its Status is
+	// final and Result holds the JSON-RPC response sent to the model.
+	Call RPCCall
+	// Duration is the time since the handler started (ToolCallEnd of a call
+	// that ran), 0 otherwise.
+	Duration time.Duration
 }
 
 // Decision approves or rejects one call awaiting confirmation.

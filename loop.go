@@ -115,6 +115,8 @@ func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 		return err
 	}
 	a.notify(ctx, st, c.ResultMessageID)
+	c.started = time.Now()
+	a.onToolCall(ctx, ToolCallStart, c)
 	timeout := a.cfg.RPCTimeout
 	if m, ok := a.methods[c.Method]; ok && m.Timeout > 0 {
 		timeout = m.Timeout
@@ -244,7 +246,13 @@ func (a *Agent) createCall(ctx context.Context, st *runState, c *RPCCall) error 
 	}
 	m := a.toolMessage(c)
 	m.ID = c.ResultMessageID
-	return a.insertMessage(ctx, st, &m)
+	if err := a.insertMessage(ctx, st, &m); err != nil {
+		return err
+	}
+	if c.Status.finished() { // answered at creation, never runs
+		a.onToolCall(ctx, ToolCallEnd, c)
+	}
+	return nil
 }
 
 func (a *Agent) completeCall(ctx context.Context, st *runState, c *RPCCall, status CallStatus, result json.RawMessage) error {
@@ -252,6 +260,7 @@ func (a *Agent) completeCall(ctx context.Context, st *runState, c *RPCCall, stat
 		return err
 	}
 	a.notify(ctx, st, c.ResultMessageID)
+	a.onToolCall(ctx, ToolCallEnd, c)
 	return nil
 }
 
@@ -281,7 +290,7 @@ func (a *Agent) insertMessage(ctx context.Context, st *runState, m *Message) err
 		return err
 	}
 	if a.cfg.OnMessage != nil {
-		a.cfg.OnMessage(ctx, *m)
+		a.callback("OnMessage", func() { a.cfg.OnMessage(ctx, *m) })
 	}
 	return nil
 }
@@ -291,7 +300,7 @@ func (a *Agent) updateMessage(ctx context.Context, st *runState, m *Message) err
 		return err
 	}
 	if a.cfg.OnMessage != nil {
-		a.cfg.OnMessage(ctx, *m)
+		a.callback("OnMessage", func() { a.cfg.OnMessage(ctx, *m) })
 	}
 	return nil
 }
@@ -302,7 +311,7 @@ func (a *Agent) notify(ctx context.Context, st *runState, messageID string) {
 		return
 	}
 	if m, err := getMessage(st.db, a.store, a.sessionID, messageID); err == nil {
-		a.cfg.OnMessage(ctx, *m)
+		a.callback("OnMessage", func() { a.cfg.OnMessage(ctx, *m) })
 	}
 }
 

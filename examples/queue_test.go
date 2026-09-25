@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -214,4 +216,89 @@ func TestRPCResultLimit(t *testing.T) {
 	if !strings.Contains(results[1], `"message":"eeeeeeeeeeeeeeeeeeee…[truncated: 80 more characters not shown]"`) {
 		t.Fatalf("error: %s", results[1])
 	}
+}
+
+// hookHandler calls fn for every log record, synchronously, so a test can act
+// at a precise point of a run.
+type hookHandler struct{ fn func(msg string) }
+
+func (h hookHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h hookHandler) Handle(_ context.Context, r slog.Record) error {
+	h.fn(r.Message)
+	return nil
+}
+func (h hookHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h hookHandler) WithGroup(string) slog.Handler      { return h }
+
+// A message enqueued after the loop's last look at the queue (here: once the
+// run has released the session) is still answered by the same Chat call.
+func TestQueueAsRunEnds(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	var once sync.Once
+	e.cfg.LogLevel = slog.LevelDebug
+	e.cfg.Logger = slog.New(hookHandler{fn: func(msg string) {
+		if msg == "run finished" {
+			once.Do(func() {
+				if _, err := e.client.Enqueue(ctx, a.SessionID(), "one more thing"); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+	}})
+	var ends []agent.RunResult
+	e.cfg.OnRunEnd = func(ctx context.Context, res agent.RunResult, err error) { ends = append(ends, res) }
+	a = e.newAgent(t, a.SessionID())
+	e.llm.push(text("first answer"), text("answer to the late message"))
+	res, err := a.Chat(ctx, "question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ends) != 1 || ends[0].Reply() != res.Reply() || len(ends[0].Messages) != 4 {
+		t.Fatalf("OnRunEnd: %d calls", len(ends))
+	}
+	if res.Reply() != "answer to the late message" || res.StopReason != agent.StopCompleted || res.Status != agent.StatusIdle {
+		t.Fatalf("%+v", res)
+	}
+	if got := roles(res.Messages); got != "user,assistant,user,assistant" {
+		t.Fatalf("merged messages: %s", got)
+	}
+	if res.Usage.PromptTokens != 2000 {
+		t.Fatalf("merged usage: %+v", res.Usage)
+	}
+	if qs, _ := e.client.QueuedMessages(ctx, a.SessionID()); len(qs) != 0 {
+		t.Fatalf("still queued: %+v", qs)
+	}
+	checkHistory(t, e, a.SessionID())
+}
+
+// If the late message is withdrawn before the follow-up run takes it, that
+// run ends without calling the model and without an error.
+func TestQueueAsRunEndsThenWithdrawn(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	var id string
+	e.cfg.LogLevel = slog.LevelDebug
+	e.cfg.Logger = slog.New(hookHandler{fn: func(msg string) {
+		switch {
+		case msg == "run finished" && id == "":
+			id, _ = e.client.Enqueue(ctx, a.SessionID(), "never mind")
+		case strings.HasPrefix(msg, "messages queued as the run ended"):
+			if err := e.client.CancelQueued(ctx, a.SessionID(), id); err != nil {
+				t.Error(err)
+			}
+		}
+	}})
+	a = e.newAgent(t, a.SessionID())
+	e.llm.push(text("only answer"))
+	res, err := a.Chat(ctx, "question")
+	if err != nil || res.Reply() != "only answer" || len(e.llm.requests) != 1 {
+		t.Fatalf("%+v %v (%d requests)", res, err, len(e.llm.requests))
+	}
+	if s, _ := a.Session(ctx); s.Status != agent.StatusIdle || s.LastError != "" {
+		t.Fatalf("%+v", s)
+	}
+	checkHistory(t, e, a.SessionID())
 }

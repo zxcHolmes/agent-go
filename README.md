@@ -486,6 +486,31 @@ for {
 
 同一进程内也可以用 `Config.OnStream`（每个文本片段）和 `Config.OnMessage`（每次写库）回调。
 
+### 事件回调
+
+除了轮询，还可以用回调把进度主动推给前端（SSE / WebSocket）、打点或触发结算：
+
+```go
+agent.Config{
+	// 运行结束时调用一次，不管怎么结束：模型不再调用工具（completed）、
+	// 等待确认（waiting_confirmation）、Stop（stopped）、出错、达到 MaxSteps。
+	OnRunEnd: func(ctx context.Context, res agent.RunResult, err error) {
+		push(res.SessionID, res.Status, res.StopReason, res.Reply())
+		if res.Status == agent.StatusWaitingConfirmation { notifyApproval(res.PendingCalls) }
+	},
+	// 工具调用开始（handler 即将执行）和结束（拿到最终结果）。
+	OnToolCall: func(ctx context.Context, ev agent.ToolCallEvent) {
+		// ev.Phase: agent.ToolCallStart / agent.ToolCallEnd
+		// ev.Call: 方法、参数、状态；结束时 Result 是发给模型的 JSON-RPC 响应
+		// ev.Duration: 结束事件里 handler 的耗时
+	},
+}
+```
+
+- `OnRunEnd`：`Chat` / `ChatMessage` / `Continue` / `Confirm` 只要开始了运行就会触发一次（因为 `ErrBusy` 等原因没开始的不触发）；`Stop` 清理没有运行中的会话（等待确认中，或持有者进程已挂）时也会触发。运行结束时顺带处理的排队消息（见“消息队列”）和本次运行合并成一次回调。
+- `OnToolCall`：执行的调用有 start 和 end；handler 结果、超时、拒绝、Stop 都有 end。创建时就有结果、不会执行的调用（内置工具、未知方法、无法解析的参数）只有 end。等待确认期间没有事件，确认后才开始。
+- 所有 `On*` 回调都在运行的 goroutine 里**同步**执行，耗时的操作请另开 goroutine；只在执行这次运行的进程里触发，进程崩溃时会丢失，**数据库仍然是唯一可信的状态**，推送只是让前端更及时。回调里的 panic 会被 recover 并记录日志，不影响运行；`BeforeLLMCall` panic 时按拒绝处理。
+
 ### 异常恢复
 
 `agent.NewClient` 启动时会恢复上次进程留下的会话（状态为 `running` / `stopping` 的会话）：
@@ -634,7 +659,7 @@ client.EnqueueMessage(ctx, sid, rawJSON)                 // 多模态消息
 - 队列存在数据库里（`agent_queued_messages`）。**下一次调用大模型之前**，队列中的所有消息按顺序各自作为一条 `role=user` 消息插入对话，同时从队列中删除，然后一次性发给模型。
 - 如果模型已经给出最终回答，队列里却还有消息，agent 会继续下一轮，回应这些补充内容，不会把它们漏掉。
 - 会话空闲时入队的消息，会在下一次 `Chat` / `Continue` 开始时插入，排在新问题之前。
-- `Enqueue` 不启动运行，也不等待。如果消息恰好在运行结束的那一刻入队（运行已经检查过队列），这次运行不会回答它，它会留在队列里，等下一次 `Chat` / `Continue`。需要确保被回答时，入队后查一下会话状态，已经是 `idle` 就调 `Continue`。
+- `Enqueue` 不启动运行，也不等待。消息即使恰好在运行结束的那一刻入队，也会被回答：运行结束、会话变为 `idle` 后会再检查一次队列，有消息就接着跑一轮（除非别的运行抢先拿到了会话，那样就由它来处理），两轮的结果合并成一个 `RunResult` 返回。
 - 插入时使用确定性的消息 ID（`msg_<队列ID>`），进程崩溃也不会重复插入。
 - **撤回**：`CancelQueued` 只能撤回还在排队的消息。运行在插入前会先“认领”队列里的消息，被认领或已经插入对话的消息撤回不了，返回 `ErrQueuedMessageSent`（模型会看到它），前端可以提示“已发送，无法撤回”。返回 `nil` 表示消息已不在队列中（这次撤回成功，或之前已撤回，或 id 不存在）。`QueuedMessages` 只列出还能撤回的消息。
 
@@ -730,6 +755,8 @@ agent.Config{
 | `OnStream` | 每个流式文本片段的回调 |
 | `OnMessage` | 每次消息写库（插入、流式刷新、工具状态变化）后回调 |
 | `OnUsage` | 每次 LLM 调用记账后回调 |
+| `OnToolCall` | 工具调用开始 / 结束的回调，见“事件回调” |
+| `OnRunEnd` | 运行结束的回调（完成、等待确认、停止、出错），见“事件回调” |
 
 ## 开发
 

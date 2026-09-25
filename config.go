@@ -180,6 +180,23 @@ type Config struct {
 	OnMessage func(ctx context.Context, m Message)
 	// OnUsage is called after each LLM call is recorded, e.g. to deduct credits.
 	OnUsage func(ctx context.Context, r UsageRecord)
+	// OnToolCall is called when a call's handler starts (ToolCallStart) and
+	// when a call gets its final result (ToolCallEnd): handler results,
+	// timeouts, rejections, stops, and calls answered without running
+	// (built-in tools, unknown methods, unparsable arguments; these have no
+	// start).
+	OnToolCall func(ctx context.Context, ev ToolCallEvent)
+	// OnRunEnd is called once when a run ends, however it ends: the model
+	// answered without tool calls, calls await confirmation, Stop, an error or
+	// MaxSteps. res.Status / res.StopReason tell which; err is what the run
+	// method returns. It covers every Chat / ChatMessage / Continue / Confirm
+	// that started a run, and Stop cleaning up a session that had no live run.
+	//
+	// All On* callbacks run synchronously on the run's goroutine (keep them
+	// fast), only in the process running the session, and are best effort: a
+	// crash loses them. The store stays the source of truth. A panic in a
+	// callback is recovered and logged.
+	OnRunEnd func(ctx context.Context, res RunResult, err error)
 }
 
 // AgentOptions are the per-agent inputs of Client.Agent.

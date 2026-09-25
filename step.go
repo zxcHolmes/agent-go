@@ -115,7 +115,7 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 			})
 		}
 		if a.cfg.OnStream != nil {
-			a.cfg.OnStream(ctx, msg.ID, dc, dr)
+			a.callback("OnStream", func() { a.cfg.OnStream(ctx, msg.ID, dc, dr) })
 		}
 		return nil
 	}
@@ -212,7 +212,7 @@ func (a *Agent) recordUsage(ctx context.Context, st *runState, rec *UsageRecord)
 	st.res.Usage.add(rec.Usage)
 	st.res.Cost.add(rec.Cost)
 	if a.cfg.OnUsage != nil {
-		a.cfg.OnUsage(ctx, *rec)
+		a.callback("OnUsage", func() { a.cfg.OnUsage(ctx, *rec) })
 	}
 	return nil
 }

@@ -29,7 +29,49 @@ type runState struct {
 // Once the session is acquired the run no longer follows the caller's ctx
 // (only its values): a run is ended by Stop, not by the request that started
 // it going away.
+//
+// A message can be enqueued after the loop's last look at the queue but
+// before the session turns idle. So when a run completes, run looks at the
+// queue again with the session idle and, if something is waiting, runs once
+// more to answer it (unless another run got the session first). The results
+// are merged into one.
 func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Context, *runState) error, loop bool) (*RunResult, error) {
+	res, err := a.runOnce(ctx, from, prepare, loop)
+	ctx = context.WithoutCancel(ctx)
+	for loop && err == nil && res.StopReason == StopCompleted {
+		qs, qerr := queuedMessages(ctx, a.store, a.sessionID, queueWaiting)
+		if qerr != nil || len(qs) == 0 {
+			break
+		}
+		a.log.Debug("messages queued as the run ended; running again", "session", a.sessionID, "count", len(qs))
+		next, nerr := a.runOnce(ctx, []Status{StatusIdle}, func(ctx context.Context, st *runState) error {
+			if n, err := a.drainQueue(ctx, st); err != nil || n > 0 {
+				return err
+			}
+			return errNothingQueued // withdrawn, or taken by another run
+		}, true)
+		if nerr != nil && next == nil {
+			break // another run has the session (ErrBusy, ErrWaitingConfirmation, ...)
+		}
+		if errors.Is(nerr, errNothingQueued) {
+			break
+		}
+		res.Messages = append(res.Messages, next.Messages...)
+		res.Usage.add(next.Usage)
+		res.Cost.add(next.Cost)
+		res.Status, res.StopReason, res.FinishReason, res.PendingCalls = next.Status, next.StopReason, next.FinishReason, next.PendingCalls
+		err = nerr
+	}
+	if res != nil && a.cfg.OnRunEnd != nil {
+		a.callback("OnRunEnd", func() { a.cfg.OnRunEnd(ctx, *res, err) })
+	}
+	return res, err
+}
+
+// errNothingQueued ends a follow-up run that found nothing left to answer.
+var errNothingQueued = errors.New("agent: nothing queued")
+
+func (a *Agent) runOnce(ctx context.Context, from []Status, prepare func(context.Context, *runState) error, loop bool) (*RunResult, error) {
 	runID, err := a.acquire(ctx, from)
 	if err != nil {
 		return nil, err
@@ -222,7 +264,7 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 		status = StatusWaitingConfirmation
 	}
 	lastErr := ""
-	if err != nil && !errors.Is(err, ErrWaitingConfirmation) {
+	if err != nil && !errors.Is(err, ErrWaitingConfirmation) && !errors.Is(err, errNothingQueued) {
 		lastErr = err.Error()
 	}
 	bookErr = errors.Join(bookErr, a.release(st, status, lastErr))
@@ -244,9 +286,12 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 	attrs := []any{"session", a.sessionID, "run", st.runID, "status", string(res.Status), "stop_reason", string(res.StopReason),
 		"duration_ms", time.Since(st.start).Milliseconds(), "prompt_tokens", res.Usage.PromptTokens,
 		"completion_tokens", res.Usage.CompletionTokens, "credits", res.Cost.Total}
-	if err != nil {
+	switch {
+	case errors.Is(err, errNothingQueued):
+		a.log.Debug("follow-up run found nothing queued", attrs...)
+	case err != nil:
 		a.log.Warn("run finished with error", append(attrs, "error", err)...)
-	} else {
+	default:
 		a.log.Info("run finished", attrs...)
 	}
 	return res, err

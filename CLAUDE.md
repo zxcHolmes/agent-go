@@ -94,8 +94,10 @@ settlement. User-facing docs are in `README.md` (Chinese).
 - `rpc.go` / `prompt.go` / `jsonschema.go` — Method/Call/Typed/NewMethod, JSON-RPC
   dispatch and result limit, system prompt + tool definition, struct-tag schemas.
 - `viewimage.go` — `view_image` tool and healing of unloadable image URLs.
-- `log.go` — slog wiring (per-agent level filter), `LLMCallInfo` and the
-  `BeforeLLMCall` hook. Info = lifecycle/errors, Debug = per request/call.
+- `log.go` — slog wiring (per-agent level filter), `LLMCallInfo`, the
+  `BeforeLLMCall` hook and `callback` (every user callback goes through it:
+  panics recovered); `OnToolCall` events (`OnRunEnd` fires in `run`).
+  Info = lifecycle/errors, Debug = per request/call.
 - `docs.go` — mounted docs (`Config.Docs` fs.FS, frontmatter parser, `read_doc`
   paging) and `SystemPromptFile`; loaded once per Client into `resources`.
 - `llm.go` / `stream.go` — HTTP client with retries, SSE parsing/accumulation.

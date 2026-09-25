@@ -2,7 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"time"
 )
 
 // LLMCallInfo describes an LLM request about to be made (Config.BeforeLLMCall).
@@ -47,6 +50,29 @@ func newLogger(cfg Config) *slog.Logger {
 }
 
 // beforeLLMCall runs the Config.BeforeLLMCall hook.
+// callback runs a user callback, recovering and logging a panic so a buggy
+// callback cannot take the run (or the process) down.
+func (a *Agent) callback(name string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			a.log.Error("callback panicked", "session", a.sessionID, "callback", name, "panic", fmt.Sprint(r))
+		}
+	}()
+	fn()
+}
+
+// onToolCall reports a call event to Config.OnToolCall.
+func (a *Agent) onToolCall(ctx context.Context, phase ToolCallPhase, c *RPCCall) {
+	if a.cfg.OnToolCall == nil {
+		return
+	}
+	ev := ToolCallEvent{Phase: phase, Call: *c}
+	if phase == ToolCallEnd && !c.started.IsZero() {
+		ev.Duration = time.Since(c.started)
+	}
+	a.callback("OnToolCall", func() { a.cfg.OnToolCall(ctx, ev) })
+}
+
 func (a *Agent) beforeLLMCall(ctx context.Context, purpose string, est, maxTokens int) error {
 	if a.cfg.BeforeLLMCall == nil {
 		return nil
@@ -59,7 +85,12 @@ func (a *Agent) beforeLLMCall(ctx context.Context, purpose string, est, maxToken
 		}
 		info.MaxCost = a.cfg.Billing.Cost(a.cfg.Model, Usage{PromptTokens: int64(est), CompletionTokens: int64(out)})
 	}
-	if err := a.cfg.BeforeLLMCall(ctx, info); err != nil {
+	var err error
+	a.callback("BeforeLLMCall", func() {
+		err = errors.New("agent: BeforeLLMCall panicked") // replaced unless it panics
+		err = a.cfg.BeforeLLMCall(ctx, info)
+	})
+	if err != nil {
 		a.log.Info("llm call rejected by BeforeLLMCall", "session", a.sessionID, "purpose", purpose, "error", err)
 		return err
 	}
