@@ -28,7 +28,7 @@ func WithoutRecovery() InitOption {
 }
 
 // Init creates the SDK tables if they do not exist and recovers sessions left
-// "running" by a previous process (crash, kill, deploy). Call it once at
+// "running" or "stopping" by a previous process (crash, kill, deploy). Call it once at
 // startup; it is idempotent.
 //
 // By default every running session is considered dead, which is right when a
@@ -47,8 +47,8 @@ func Init(ctx context.Context, store Store, opts ...InitOption) error {
 	if o.noRecovery {
 		return nil
 	}
-	q := "SELECT id FROM agent_sessions WHERE status = ?"
-	args := []any{string(StatusRunning)}
+	q := "SELECT id FROM agent_sessions WHERE status IN (?, ?)"
+	args := []any{string(StatusRunning), string(StatusStopping)}
 	if o.staleAfter > 0 {
 		q += " AND updated_at < ?"
 		args = append(args, nowMillis()-o.staleAfter.Milliseconds())
@@ -86,14 +86,16 @@ const crashNote = "recovered: the process stopped while this session was running
 //   - RPC calls that were running become "failed" with a CodeCrashed error
 //     result (they may or may not have taken effect);
 //   - queued / approved calls that never started become "cancelled";
-//   - calls awaiting confirmation are kept;
+//   - calls awaiting confirmation are kept, unless the session was stopping
+//     (then they are cancelled as stopped by user);
 //   - the session becomes idle, or waiting_confirmation if calls still await
 //     approval, and last_error records the recovery.
 //
 // Init calls it for every crashed session. Only call it directly when you know
 // no run is active for the session.
 func ResetSession(ctx context.Context, store Store, id string) error {
-	if _, err := GetSession(ctx, store, id); err != nil {
+	s, err := GetSession(ctx, store, id)
+	if err != nil {
 		return err
 	}
 	if err := recoverSessionData(ctx, store, id); err != nil {
@@ -103,11 +105,19 @@ func ResetSession(ctx context.Context, store Store, id string) error {
 	if err != nil {
 		return err
 	}
+	if s.Status == StatusStopping {
+		for i := range pending {
+			if err := completeCall(ctx, store, &pending[i], CallCancelled, rpcErrorResponse(pending[i].RPCID, errStoppedNotRun)); err != nil {
+				return err
+			}
+		}
+		pending = nil
+	}
 	status := StatusIdle
 	if len(pending) > 0 {
 		status = StatusWaitingConfirmation
 	}
-	_, err = store.Exec(ctx, "UPDATE agent_sessions SET status = ?, run_id = '', stop_requested = 0, last_error = ?, updated_at = ? WHERE id = ?",
+	_, err = store.Exec(ctx, "UPDATE agent_sessions SET status = ?, run_id = '', last_error = ?, updated_at = ? WHERE id = ?",
 		string(status), crashNote, nowMillis(), id)
 	return err
 }

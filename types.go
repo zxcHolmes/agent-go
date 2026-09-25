@@ -14,6 +14,9 @@ const (
 	StatusIdle Status = "idle"
 	// StatusRunning means the agent loop is executing.
 	StatusRunning Status = "running"
+	// StatusStopping means Stop was called and the run is shutting down; it
+	// becomes StatusIdle as soon as the run has exited.
+	StatusStopping Status = "stopping"
 	// StatusWaitingConfirmation means the loop paused on RPC calls that need
 	// approval; call Confirm to resume.
 	StatusWaitingConfirmation Status = "waiting_confirmation"

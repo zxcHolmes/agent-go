@@ -316,11 +316,14 @@ func TestStreamingFlush(t *testing.T) {
 	// Poll like a frontend would: cursor = the user message, fetch everything after it.
 	var user agent.Message
 	waitFor(t, "user message", func() bool {
-		ms, _ := a.LatestMessages(ctx, 1)
-		if len(ms) == 1 {
-			user = ms[0]
+		ms, _ := a.LatestMessages(ctx, 5)
+		for _, m := range ms {
+			if m.Role == "user" {
+				user = m
+				return true
+			}
 		}
-		return len(ms) == 1
+		return false
 	})
 	var seen []string
 	waitFor(t, "stream to finish", func() bool {
@@ -407,12 +410,13 @@ func TestConfirmation(t *testing.T) {
 
 func TestStopAndContinue(t *testing.T) {
 	started := make(chan struct{})
+	release := make(chan struct{})
 	e := setup(t, agent.Method{
 		Name: "slow",
 		Handler: func(ctx context.Context, c *agent.Call) (any, error) {
 			close(started)
-			<-ctx.Done()
-			return nil, ctx.Err()
+			<-release // ignores ctx on purpose: Stop must not wait for it
+			return "late result", nil
 		},
 	})
 	ctx := context.Background()
@@ -430,9 +434,6 @@ func TestStopAndContinue(t *testing.T) {
 		done <- res
 	}()
 	<-started
-	if st, _ := a.Status(ctx); st != agent.StatusRunning {
-		t.Fatal(st)
-	}
 	ms, _ := a.LatestMessages(ctx, 10)
 	if got := statuses(ms); got != "done,done,running,pending" {
 		t.Fatalf("while running: %s", got)
@@ -441,15 +442,18 @@ func TestStopAndContinue(t *testing.T) {
 		t.Fatalf("want ErrBusy, got %v", err)
 	}
 	// Stop through a different Agent instance, as a separate HTTP request would.
+	start := time.Now()
 	if err := e.newAgent(t, a.SessionID()).Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var res *agent.RunResult
-	select {
-	case res = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("stop did not interrupt the run")
+	if time.Since(start) > time.Second {
+		t.Fatalf("Stop took %v", time.Since(start))
 	}
+	// Stop is synchronous: the session is idle as soon as it returns.
+	if st, _ := a.Status(ctx); st != agent.StatusIdle {
+		t.Fatal(st)
+	}
+	res := <-done
 	if res.StopReason != agent.StopStopped || res.Status != agent.StatusIdle {
 		t.Fatalf("%+v", res)
 	}
@@ -457,14 +461,256 @@ func TestStopAndContinue(t *testing.T) {
 	if roles(all) != "user,assistant,tool,tool" || statuses(all) != "done,done,done,done" {
 		t.Fatal(roles(all), statuses(all))
 	}
-	if !strings.Contains(all[3].Content, `"code":-32002`) {
-		t.Fatalf("second call should be cancelled: %s", all[3].Content)
+	if !strings.Contains(all[2].Content, "stopped by user while this call was running") ||
+		!strings.Contains(all[3].Content, "stopped by user: this call was not executed") {
+		t.Fatalf("results:\n%s\n%s", all[2].Content, all[3].Content)
+	}
+	// The abandoned handler finishing later changes nothing.
+	close(release)
+	time.Sleep(50 * time.Millisecond)
+	after, _ := a.LatestMessages(ctx, 100)
+	if after[2].Content != all[2].Content {
+		t.Fatal("late handler result overwrote the stop result")
+	}
+	// Repeated Stop on an idle session is a no-op.
+	if err := a.Stop(ctx); err != nil {
+		t.Fatal(err)
 	}
 
 	e.llm.push(text("resumed"))
-	res, err := a.Continue(ctx)
+	res, err := a.Chat(ctx, "continue") // no ErrBusy right after Stop
 	if err != nil || res.Reply() != "resumed" {
 		t.Fatal(res, err)
+	}
+}
+
+func TestStopWhileWaitingConfirmation(t *testing.T) {
+	e := setup(t, agent.NewMethod("refund", func(ctx context.Context, c *agent.Call, p orderParams) (string, error) {
+		t.Error("must not run")
+		return "", nil
+	}, agent.MethodDoc{RequireConfirm: true}))
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	e.llm.push(toolCall("c1", "refund", `{"order_id":"O-1"}`))
+	if res, err := a.Chat(ctx, "refund"); err != nil || res.Status != agent.StatusWaitingConfirmation {
+		t.Fatal(res, err)
+	}
+	if err := a.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := a.Session(ctx)
+	p, _ := a.PendingCalls(ctx)
+	ms, _ := a.LatestMessages(ctx, 1)
+	if s.Status != agent.StatusIdle || len(p) != 0 || !strings.Contains(ms[0].Content, "stopped by user") || ms[0].Status != agent.MessageDone {
+		t.Fatalf("%+v %v %+v", s, p, ms[0])
+	}
+}
+
+func TestStopConcurrentAndRepeated(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	e.llm.pushReply(reply{msg: text("abcdefghi"), hangAfter: 1})
+	done := make(chan *agent.RunResult)
+	go func() {
+		res, _ := a.Chat(ctx, "hi")
+		done <- res
+	}()
+	<-e.llm.hung
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- e.newAgent(t, a.SessionID()).Stop(ctx)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if res := <-done; res.StopReason != agent.StopStopped {
+		t.Fatalf("%+v", res)
+	}
+	if st, _ := a.Status(ctx); st != agent.StatusIdle {
+		t.Fatal(st)
+	}
+}
+
+// Stop racing a run that ends on its own must always leave the session idle.
+func TestStopRacesCompletion(t *testing.T) {
+	e := setup(t, agent.NewMethod("refund", func(ctx context.Context, c *agent.Call, p orderParams) (string, error) {
+		return "ok", nil
+	}, agent.MethodDoc{RequireConfirm: true}))
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	for i := 0; i < 30; i++ {
+		if i%2 == 0 {
+			e.llm.push(text("done"))
+		} else {
+			e.llm.push(toolCall(fmt.Sprintf("c%d", i), "refund", `{"order_id":"O"}`)) // ends waiting for confirmation
+		}
+		done := make(chan error)
+		go func() {
+			_, err := a.Chat(ctx, "hi")
+			done <- err
+		}()
+		time.Sleep(time.Duration(i%5) * time.Millisecond)
+		if err := a.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil && !errors.Is(err, agent.ErrBusy) {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if err := a.Stop(ctx); err != nil { // Chat may have started after the first Stop
+			t.Fatal(err)
+		}
+		s, _ := a.Session(ctx)
+		p, _ := a.PendingCalls(ctx)
+		if s.Status != agent.StatusIdle || len(p) != 0 {
+			t.Fatalf("iteration %d: status %s, %d pending", i, s.Status, len(p))
+		}
+		e.llm.mu.Lock()
+		e.llm.replies = nil // drop the reply if Stop won before the request
+		e.llm.mu.Unlock()
+	}
+}
+
+func TestStopFromAnotherProcess(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	e.llm.pushReply(reply{msg: text("abcdefghi"), hangAfter: 1})
+	done := make(chan *agent.RunResult)
+	go func() {
+		res, _ := a.Chat(ctx, "hi")
+		done <- res
+	}()
+	<-e.llm.hung
+	// What Stop in another process writes; the local run has no in-memory signal.
+	if _, err := e.store.Exec(ctx, "UPDATE agent_sessions SET status = 'stopping' WHERE id = ?", a.SessionID()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case res := <-done:
+		if res.StopReason != agent.StopStopped || res.Status != agent.StatusIdle {
+			t.Fatalf("%+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote stop not noticed")
+	}
+}
+
+func TestStopDeadRun(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	// A run whose process died mid-stream, long ago.
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	if _, err := e.store.Exec(ctx, "UPDATE agent_sessions SET status = 'running', run_id = 'run_dead', updated_at = ? WHERE id = ?", old, a.SessionID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.Exec(ctx, `INSERT INTO agent_messages (id, session_id, seq, role, status, content, reasoning, tool_call_id, raw, created_at, updated_at)
+		VALUES ('msg_dead', ?, 1, 'assistant', 'streaming', 'half', '', '', '{"role":"assistant","content":"half"}', ?, ?)`, a.SessionID(), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := a.GetMessage(ctx, "msg_dead")
+	if st, _ := a.Status(ctx); st != agent.StatusIdle || m.Status != agent.MessageInterrupted {
+		t.Fatalf("%s %s", st, m.Status)
+	}
+}
+
+func TestBillingSettlement(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	e.llm.push(toolCall("c1", "get_order", `{"order_id":"O"}`), text("a"))
+	if _, err := a.Chat(ctx, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	sum, recs, err := a.UnbilledUsage(ctx)
+	perCall := 200*100.0/1e6 + 800*10.0/1e6 + 100*1000.0/1e6
+	if err != nil || sum.Calls != 2 || len(recs) != 2 || abs(sum.Cost.Total-2*perCall) > 1e-9 {
+		t.Fatalf("%+v %v", sum, err)
+	}
+
+	// Charge fails: records go back to the pool.
+	if _, err := a.SettleUsage(ctx, func(ctx context.Context, b *agent.Bill) error { return errors.New("no balance") }); err == nil {
+		t.Fatal("want error")
+	}
+	_, recs, _ = a.UnbilledUsage(ctx)
+	if len(recs) != 2 || recs[0].BillID != "" {
+		t.Fatalf("not released: %+v", recs)
+	}
+
+	var charged float64
+	bill, err := a.SettleUsage(ctx, func(ctx context.Context, b *agent.Bill) error {
+		charged += b.Summary.Cost.Total
+		return nil
+	})
+	if err != nil || bill == nil || bill.Summary.Calls != 2 || abs(charged-2*perCall) > 1e-9 {
+		t.Fatalf("%+v %v", bill, err)
+	}
+	if sum, _, _ := a.UnbilledUsage(ctx); sum.Calls != 0 {
+		t.Fatal("still unbilled")
+	}
+	if b, err := a.SettleUsage(ctx, func(context.Context, *agent.Bill) error { t.Error("nothing to charge"); return nil }); b != nil || err != nil {
+		t.Fatal(b, err)
+	}
+	all, _ := agent.ListUsage(ctx, e.store, a.SessionID())
+	if all[0].BillID != bill.ID || all[0].BilledAt == nil {
+		t.Fatalf("%+v", all[0])
+	}
+
+	// Concurrent settlements never charge a record twice.
+	for i := 0; i < 5; i++ {
+		e.llm.push(text("x"))
+		if _, err := a.Chat(ctx, "more"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	var billedCalls int64
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := a.SettleUsage(ctx, func(ctx context.Context, b *agent.Bill) error {
+				mu.Lock()
+				billedCalls += b.Summary.Calls
+				mu.Unlock()
+				return nil
+			})
+			if err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if billedCalls != 5 {
+		t.Fatalf("charged %d calls, want 5", billedCalls)
+	}
+
+	// Manual marking.
+	e.llm.push(text("y"))
+	_, _ = a.Chat(ctx, "again")
+	_, recs, _ = agent.UnbilledUsage(ctx, e.store, "") // all sessions
+	if len(recs) != 1 {
+		t.Fatal(len(recs))
+	}
+	if _, err := agent.MarkBilled(ctx, e.store, "ledger-42", recs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if sum, _, _ := agent.UnbilledUsage(ctx, e.store, ""); sum.Calls != 0 {
+		t.Fatal("MarkBilled did not mark")
 	}
 }
 

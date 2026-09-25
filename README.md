@@ -168,9 +168,9 @@ agent.ResetSession(ctx, store, sid)                     // 手动恢复单个会
 | `a.Chat(ctx, prompt)` | 追加用户消息并运行 agent loop，阻塞直到结束 |
 | `a.ChatMessage(ctx, rawJSON)` | 同上，自己构造用户消息（多模态图片等） |
 | `a.Continue(ctx)` | 不加新消息继续运行（Stop 后、报错后、输出被截断后） |
-| `a.Stop(ctx)` | 停止正在运行的 loop，立即返回；可在另一个 goroutine / 另一个进程调用 |
+| `a.Stop(ctx)` | 停止会话，**阻塞到会话变为 `idle`** 才返回；幂等，可并发、可跨进程调用（详见下文“Stop”） |
 | `a.Confirm(ctx, decisions...)` | 批准 / 拒绝待确认的 RPC 调用，全部处理完后继续 loop |
-| `a.Status(ctx)` | `idle` / `running` / `waiting_confirmation` |
+| `a.Status(ctx)` | `idle` / `running` / `stopping` / `waiting_confirmation` |
 | `a.PendingCalls(ctx)` | 待确认的 RPC 调用列表 |
 | `a.Usage(ctx)` | 会话累计 token 与积分 |
 
@@ -178,7 +178,7 @@ agent.ResetSession(ctx, store, sid)                     // 手动恢复单个会
 
 - `completed`：模型给出不含工具调用的回复
 - `waiting_confirmation`：有 `RequireConfirm` 的方法等待确认（同一轮中不需要确认的调用已先执行）
-- `stopped`：调用了 `Stop`。正在流式输出的消息保留已生成部分（`interrupted`），尚未执行的调用以 `-32002 cancelled` 结果回填，保证历史合法
+- `stopped`：调用了 `Stop`，见下文
 - `max_steps`：达到 `Config.MaxSteps`（默认 50 次 LLM 调用）
 
 `Chat` 会阻塞到本次运行结束，Web 服务里一般放到 goroutine 中执行，前端轮询数据库获取进度（见“流式输出与前端轮询”）。`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
@@ -186,6 +186,40 @@ agent.ResetSession(ctx, store, sid)                     // 手动恢复单个会
 **状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行期间后台每几秒心跳一次（流式输出和长时间的 RPC 调用中也会），超过 `Config.StaleAfter`（默认 1 分钟）没有心跳的会话可被其他运行接管。进程重启时由 `Init` 统一恢复，见“异常恢复”。
 
 典型 Web 服务用法：一个请求里 `go a.Chat(...)`，另一个请求用同一个 session id `agent.New(...)` 后调 `Stop` / `Status` / `PendingCalls` / `Confirm`。
+
+### Stop
+
+状态流转：
+
+```
+idle ──Chat/Continue──▶ running ──完成──▶ idle
+                          │    └──需要确认──▶ waiting_confirmation ──Confirm──▶ running
+                          │                          │
+                          └──Stop──▶ stopping ──▶ idle ◀──Stop──┘
+```
+
+调用 `Stop` 后：
+
+- **大模型输出中**：立刻取消请求，已生成的文本保留为不完整的助手消息（`interrupted`），会进入后续对话历史。
+- **工具调用执行中**：**不等待** handler，立刻把结果写成 `stopped by user while this call was running; it may or may not have taken effect`。handler 的 ctx 会被取消，它之后返回的结果会被丢弃，不会写入数据库（Go 无法强杀 goroutine，handler 应该尊重 ctx）。
+- **未执行的调用**（排队中、已批准未执行、**等待确认中**）：结果写成 `stopped by user: this call was not executed`。
+- 以上错误码都是 `-32002`，全部写完后会话变为 `idle`。**Stop 之后会话总是 `idle`**，不会停在 `waiting_confirmation`。
+
+并发与竞争：
+
+| 情况 | 行为 |
+| --- | --- |
+| 重复 / 并发调用 `Stop` | 幂等。都会等到 `idle` 后返回 `nil` |
+| 会话已是 `idle` | 立即返回 `nil` |
+| 会话是 `waiting_confirmation` | 取消所有待确认调用，变为 `idle` |
+| `Stop` 与运行自然结束同时发生 | 如果运行结束时发现状态已是 `stopping`，按停止处理；如果运行抢先变成 `waiting_confirmation`，`Stop` 会接着取消待确认调用。最终都是 `idle` |
+| `Stop` 返回后立刻 `Chat` | 可以，不会 `ErrBusy` |
+| `stopping` 期间调用 `Chat` | 返回 `ErrBusy` |
+| 另一个进程调用 `Stop` | 运行方每 500ms 检查一次状态，约半秒内停止 |
+| 持有会话的进程已经挂了 | 超过 `StaleAfter` 没有心跳时，`Stop` 自己接管并清理（等同崩溃恢复），不会一直等 |
+| 传给 `Stop` 的 ctx 超时 | 返回 ctx 的错误，但停止流程仍会继续完成 |
+
+`Chat` 被停止时返回 `RunResult{StopReason: "stopped", Status: "idle"}`，`err` 为 `nil`。
 
 ### RPC 方法
 
@@ -280,7 +314,7 @@ Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 | `agent.InvalidParams(...)` / `Bind` 失败 / `Validate` 失败 | `-32602` |
 | handler 返回普通 error 或 panic | `-32603`，message 为错误内容 |
 | 用户拒绝确认 | `-32001` |
-| 运行被 Stop / 进程重启而未执行 | `-32002` |
+| 被 Stop（执行中或未执行）/ 进程重启时未执行 | `-32002` |
 | 执行过程中进程崩溃（可能已生效，也可能没有） | `-32003` |
 | 自定义 | `agent.NewRPCError(code, msg, data)` |
 
@@ -349,6 +383,7 @@ for {
 | 崩溃时所处阶段 | 恢复后 |
 | --- | --- |
 | 会话状态 `running` | 改为 `idle`；如果还有等待确认的调用则为 `waiting_confirmation`。`last_error` 记录恢复原因 |
+| 会话状态 `stopping` | 按停止处理完（包括取消待确认调用），改为 `idle` |
 | 大模型流式输出中 | 助手消息改为 `interrupted`，保留已写入的部分内容（最多丢失最后一个刷新间隔的内容），可以直接继续对话 |
 | 工具调用执行中（`running`） | 调用标记为 `failed`，tool 消息写入 `-32003` 错误：“系统崩溃，调用可能已生效也可能没有” |
 | 工具调用已排队但还没开始 | 标记为 `cancelled`，写入 `-32002` 错误 |
@@ -384,14 +419,45 @@ type Billing interface { Cost(model string, usage agent.Usage) agent.Cost }
 
 计算方式：非缓存输入 = `prompt_tokens - cached_tokens - cache_write_tokens`，分别乘以对应单价。
 
-查询与扣费：
+查询：
 
 ```go
 recs, _ := agent.ListUsage(ctx, store, sid)       // 每次调用明细
-sum, _ := agent.SessionUsage(ctx, store, sid)     // 汇总
-// 实时扣费：
-Config.OnUsage = func(ctx context.Context, r agent.UsageRecord) { deduct(r.Cost.Total) }
+sum, _ := agent.SessionUsage(ctx, store, sid)     // 累计汇总（含已结算）
 ```
+
+#### 结算（扣积分）
+
+积分只在每次 LLM 调用结束时产生，每条 `agent_llm_calls` 记录都带结算状态：未结算、已认领（`BillID` 有值、`BilledAt` 为空）、已结算（`BilledAt` 有值）。
+
+**推荐：`SettleUsage` 一步结算**，并发安全，不会重复扣费：
+
+```go
+bill, err := agent.SettleUsage(ctx, store, sid, func(ctx context.Context, b *agent.Bill) error {
+	// b.Summary.Cost.Total 为本次要扣的积分，b.Records 为明细
+	// 用 b.ID 作为幂等键写入你的账本
+	return wallet.Deduct(ctx, userID, b.Summary.Cost.Total, b.ID)
+})
+// bill == nil && err == nil 表示没有待结算的记录
+```
+
+流程：先用一条原子 `UPDATE` 把该会话所有未结算记录认领到新的 `bill.ID` 下（同一条记录只能被认领一次，多个 worker 并发结算也不会重复），然后调用你的 `charge`：
+
+- `charge` 返回 `nil` → 记录标记为已结算；
+- `charge` 返回错误（如余额不足）→ 记录释放回未结算，下次再结算，错误原样返回；
+- 进程在 `charge` 期间崩溃 → 记录保持“已认领”，在 `UnbilledUsage` 里能看到 `BillID`。去账本查这个 ID，已扣则 `agent.CompleteBill(ctx, store, billID)`，未扣则 `agent.ReleaseBill(ctx, store, billID)`。
+
+**也可以手动查询 + 标记**：
+
+```go
+sum, recs, _ := agent.UnbilledUsage(ctx, store, sid)  // 未结算的汇总和明细；sid 传 "" 表示所有会话
+// ... 自己扣费 ...
+agent.MarkBilled(ctx, store, "你的账单号", recordIDs...) // 已结算的记录不会被重复标记
+```
+
+Agent 上也有便捷方法 `a.UnbilledUsage(ctx)`、`a.SettleUsage(ctx, charge)`。需要实时处理的话，还可以用 `Config.OnUsage` 回调，每次 LLM 调用记账后触发。
+
+注意：被 Stop 打断或出错的流式请求，服务商通常不会返回 usage，这部分消耗无法记录。
 
 ### 前缀缓存
 
@@ -420,7 +486,7 @@ type Store interface {
 | --- | --- |
 | `agent_sessions` | 会话、状态、运行锁、last_error、metadata |
 | `agent_messages` | 消息，`(session_id, seq)` 唯一，`raw` 为完整原始 JSON，`status` 为流式 / 执行状态 |
-| `agent_llm_calls` | 每次 LLM 调用的全部 token 字段、原始 usage、积分、延迟 |
+| `agent_llm_calls` | 每次 LLM 调用的全部 token 字段、原始 usage、积分、延迟、结算状态（`bill_id` / `claimed_at` / `billed_at`） |
 | `agent_rpc_calls` | 每次 RPC 调用：方法、参数、状态、确认、JSON-RPC 结果 |
 
 ### 其他配置

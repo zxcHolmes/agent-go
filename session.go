@@ -44,7 +44,7 @@ func CreateSession(ctx context.Context, store Store, metadata map[string]any) (s
 	id := newID("ses")
 	now := nowMillis()
 	_, err := store.Exec(ctx,
-		"INSERT INTO agent_sessions (id, status, run_id, stop_requested, last_error, metadata, created_at, updated_at) VALUES (?, ?, '', 0, '', ?, ?, ?)",
+		"INSERT INTO agent_sessions (id, status, run_id, last_error, metadata, created_at, updated_at) VALUES (?, ?, '', '', ?, ?, ?)",
 		id, string(StatusIdle), string(meta), now, now)
 	if err != nil {
 		return "", fmt.Errorf("agent: create session: %w", err)
@@ -425,12 +425,12 @@ func PendingCalls(ctx context.Context, store Store, sessionID string) ([]RPCCall
 
 // ---- usage ----
 
-const usageCols = "id, session_id, message_id, model, response_id, finish_reason, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, audio_input_tokens, audio_output_tokens, accepted_prediction_tokens, rejected_prediction_tokens, raw_usage, input_credits, cached_credits, cache_write_credits, output_credits, total_credits, latency_ms, created_at"
+const usageCols = "id, session_id, message_id, model, response_id, finish_reason, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, audio_input_tokens, audio_output_tokens, accepted_prediction_tokens, rejected_prediction_tokens, raw_usage, input_credits, cached_credits, cache_write_credits, output_credits, total_credits, latency_ms, bill_id, claimed_at, billed_at, created_at"
 
 func insertUsage(ctx context.Context, store Store, r *UsageRecord) error {
 	u, c := r.Usage, r.Cost
 	_, err := store.Exec(ctx,
-		"INSERT INTO agent_llm_calls ("+usageCols+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO agent_llm_calls ("+usageCols+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?)",
 		r.ID, r.SessionID, r.MessageID, r.Model, r.ResponseID, r.FinishReason,
 		u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.CacheWriteTokens, u.ReasoningTokens,
 		u.AudioInputTokens, u.AudioOutputTokens, u.AcceptedPredictionTokens, u.RejectedPredictionTokens,
@@ -441,9 +441,8 @@ func insertUsage(ctx context.Context, store Store, r *UsageRecord) error {
 	return nil
 }
 
-// ListUsage returns every LLM call of a session, oldest first.
-func ListUsage(ctx context.Context, store Store, sessionID string) ([]UsageRecord, error) {
-	rows, err := store.Query(ctx, "SELECT "+usageCols+" FROM agent_llm_calls WHERE session_id = ? ORDER BY created_at ASC", sessionID)
+func queryUsage(ctx context.Context, store Store, where string, args ...any) ([]UsageRecord, error) {
+	rows, err := store.Query(ctx, "SELECT "+usageCols+" FROM agent_llm_calls WHERE "+where+" ORDER BY created_at ASC", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -452,19 +451,33 @@ func ListUsage(ctx context.Context, store Store, sessionID string) ([]UsageRecor
 	for rows.Next() {
 		var r UsageRecord
 		var raw string
-		var created int64
+		var claimed, billed, created int64
 		u, c := &r.Usage, &r.Cost
 		if err := rows.Scan(&r.ID, &r.SessionID, &r.MessageID, &r.Model, &r.ResponseID, &r.FinishReason,
 			&u.PromptTokens, &u.CompletionTokens, &u.TotalTokens, &u.CachedTokens, &u.CacheWriteTokens, &u.ReasoningTokens,
 			&u.AudioInputTokens, &u.AudioOutputTokens, &u.AcceptedPredictionTokens, &u.RejectedPredictionTokens,
-			&raw, &c.Input, &c.CachedInput, &c.CacheWrite, &c.Output, &c.Total, &r.LatencyMs, &created); err != nil {
+			&raw, &c.Input, &c.CachedInput, &c.CacheWrite, &c.Output, &c.Total, &r.LatencyMs,
+			&r.BillID, &claimed, &billed, &created); err != nil {
 			return nil, err
 		}
 		r.RawUsage = rawOrNil(raw)
 		r.CreatedAt = fromMillis(created)
+		if claimed > 0 {
+			t := fromMillis(claimed)
+			r.ClaimedAt = &t
+		}
+		if billed > 0 {
+			t := fromMillis(billed)
+			r.BilledAt = &t
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListUsage returns every LLM call of a session, oldest first.
+func ListUsage(ctx context.Context, store Store, sessionID string) ([]UsageRecord, error) {
+	return queryUsage(ctx, store, "session_id = ?", sessionID)
 }
 
 // SessionUsage sums token usage and credits over all LLM calls of a session.

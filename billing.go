@@ -161,6 +161,12 @@ type UsageRecord struct {
 	Cost         Cost            `json:"cost"`
 	LatencyMs    int64           `json:"latency_ms"`
 	CreatedAt    time.Time       `json:"created_at"`
+
+	// Billing state. Unbilled: BilledAt == nil. BillID/ClaimedAt are set when
+	// SettleUsage claims the record; BilledAt when it is marked billed.
+	BillID    string     `json:"bill_id,omitempty"`
+	ClaimedAt *time.Time `json:"claimed_at,omitempty"`
+	BilledAt  *time.Time `json:"billed_at,omitempty"`
 }
 
 // UsageSummary aggregates all LLM calls of a session.

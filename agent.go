@@ -241,6 +241,16 @@ func (a *Agent) Usage(ctx context.Context) (*UsageSummary, error) {
 	return SessionUsage(ctx, a.store, a.sessionID)
 }
 
+// UnbilledUsage returns the session's LLM calls not marked billed yet.
+func (a *Agent) UnbilledUsage(ctx context.Context) (*UsageSummary, []UsageRecord, error) {
+	return UnbilledUsage(ctx, a.store, a.sessionID)
+}
+
+// SettleUsage bills the session's unbilled LLM calls; see the package-level SettleUsage.
+func (a *Agent) SettleUsage(ctx context.Context, charge func(ctx context.Context, bill *Bill) error) (*Bill, error) {
+	return SettleUsage(ctx, a.store, a.sessionID, charge)
+}
+
 // Chat appends a user message and runs the agent loop until the model answers
 // without tool calls, a call needs confirmation, Stop is called, or MaxSteps
 // is reached. It blocks for the whole run; poll the store for progress.
@@ -275,18 +285,18 @@ func (a *Agent) ChatMessage(ctx context.Context, raw json.RawMessage) (*RunResul
 			}
 		}
 		// Leftovers from an interrupted run: close them so the history stays valid.
-		if err := a.cancelCalls(ctx, st, open, "cancelled: superseded by a new user message"); err != nil {
+		if err := a.cancelCalls(ctx, st, open, false, &RPCError{Code: CodeCancelled, Message: "cancelled: superseded by a new user message"}); err != nil {
 			return err
 		}
 		m := newMessage(a.sessionID, raw, MessageDone)
 		return a.insertMessage(ctx, st, &m)
-	})
+	}, true)
 }
 
 // Continue resumes the loop without a new user message, e.g. after Stop, an
 // error, a crash or a truncated answer.
 func (a *Agent) Continue(ctx context.Context) (*RunResult, error) {
-	return a.run(ctx, []Status{StatusIdle}, nil)
+	return a.run(ctx, []Status{StatusIdle}, nil, true)
 }
 
 // Confirm approves or rejects calls awaiting confirmation. Once no call is
@@ -325,19 +335,72 @@ func (a *Agent) Confirm(ctx context.Context, decisions ...Decision) (*RunResult,
 			}
 		}
 		return nil
-	})
+	}, true)
 }
 
-// Stop interrupts the running loop of this session, in this process or
-// another one. A streaming answer keeps its partial text (status
-// "interrupted"); calls not yet executed are cancelled; the session becomes
-// idle (or waiting_confirmation if calls still await approval). Stop returns
-// immediately.
+// Stop stops the session and blocks until it is idle. It is idempotent and
+// safe to call concurrently, from any process sharing the store.
+//
+//   - running: the session turns "stopping"; the run is interrupted at once. A
+//     streaming answer is cut off and keeps its partial text ("interrupted"),
+//     the LLM request is cancelled, a running RPC call is abandoned without
+//     waiting for its handler (the handler's ctx is cancelled and its eventual
+//     result discarded), and every unfinished call, including calls awaiting
+//     confirmation, gets a "stopped by user" error result.
+//   - waiting_confirmation: pending calls get "stopped by user".
+//   - stopping: waits for the stop in progress.
+//   - idle: returns nil immediately.
+//
+// A run whose process died (no heartbeat for Config.StaleAfter) is taken over
+// and cleaned up by Stop itself. If ctx ends first, Stop returns its error;
+// the session still finishes stopping on its own.
 func (a *Agent) Stop(ctx context.Context) error {
-	if v, ok := running.Load(a.sessionID); ok {
-		v.(*localRun).cancel(ErrStopped)
+	for {
+		s, err := GetSession(ctx, a.store, a.sessionID)
+		if err != nil {
+			return err
+		}
+		switch s.Status {
+		case StatusIdle:
+			return nil
+		case StatusWaitingConfirmation:
+			if err := a.stopIdle(ctx); err != nil && !errors.Is(err, ErrBusy) && !errors.Is(err, ErrNoPendingCalls) {
+				return err
+			}
+			continue // re-read: someone may have raced us
+		case StatusRunning, StatusStopping:
+			if s.Status == StatusRunning {
+				// updated_at is left alone so a dead run still looks stale.
+				if _, err := a.store.Exec(ctx, "UPDATE agent_sessions SET status = ? WHERE id = ? AND status = ?",
+					string(StatusStopping), a.sessionID, string(StatusRunning)); err != nil {
+					return err
+				}
+			}
+			if v, ok := running.Load(a.sessionID); ok {
+				v.(*localRun).cancel(ErrStopped)
+			}
+			if time.Since(s.UpdatedAt) > a.cfg.StaleAfter {
+				// The owning process is gone: take over and clean up here.
+				if err := a.stopIdle(ctx); err != nil && !errors.Is(err, ErrBusy) && !errors.Is(err, ErrNoPendingCalls) {
+					return err
+				}
+				continue
+			}
+		}
+		t := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return context.Cause(ctx)
+		case <-t.C:
+		}
 	}
-	_, err := a.store.Exec(ctx, "UPDATE agent_sessions SET stop_requested = 1 WHERE id = ? AND status = ?", a.sessionID, string(StatusRunning))
+}
+
+// stopIdle takes the session (waiting for confirmation, or abandoned by a dead
+// run), repairs it, cancels every unfinished call and leaves it idle.
+func (a *Agent) stopIdle(ctx context.Context) error {
+	_, err := a.run(ctx, []Status{StatusWaitingConfirmation}, nil, false)
 	return err
 }
 
@@ -358,7 +421,9 @@ type runState struct {
 	res      *RunResult
 }
 
-func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Context, *runState) error) (*RunResult, error) {
+// run acquires the session and drives it. With loop=false it only heals the
+// session and stops it (used by Stop).
+func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Context, *runState) error, loop bool) (*RunResult, error) {
 	runID, err := a.acquire(ctx, from)
 	if err != nil {
 		return nil, err
@@ -378,30 +443,41 @@ func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Con
 	if err == nil && prepare != nil {
 		err = prepare(runCtx, st)
 	}
-	if err == nil {
+	switch {
+	case err != nil:
+	case loop:
 		reason, err = a.loop(runCtx, st)
+	default:
+		st.cancel(ErrStopped)
+		err = ErrStopped
 	}
 	hbDone()
 	return a.finish(runCtx, st, reason, err)
 }
 
-// heartbeat keeps the session lock fresh while the run is alive and relays
-// stop requests from other processes, even in the middle of a stream or a
-// long RPC call. The returned func stops it and waits for it to exit.
+// heartbeat keeps the session lock fresh while the run is alive and watches
+// for Stop from other processes (status "stopping"), so a stop interrupts even
+// the middle of a stream or a long RPC call within ~500ms. The returned func
+// stops it and waits for it to exit.
 func (a *Agent) heartbeat(ctx context.Context, st *runState) func() {
-	every := a.cfg.StaleAfter / 4
-	if every > 5*time.Second {
-		every = 5 * time.Second
+	beatEvery := a.cfg.StaleAfter / 4
+	if beatEvery > 5*time.Second {
+		beatEvery = 5 * time.Second
 	}
-	if every < 100*time.Millisecond {
-		every = 100 * time.Millisecond
+	pollEvery := 500 * time.Millisecond
+	if beatEvery < pollEvery {
+		pollEvery = beatEvery
+	}
+	if pollEvery < 50*time.Millisecond {
+		pollEvery = 50 * time.Millisecond
 	}
 	quit := make(chan struct{})
 	exited := make(chan struct{})
 	go func() {
 		defer close(exited)
-		t := time.NewTicker(every)
+		t := time.NewTicker(pollEvery)
 		defer t.Stop()
+		lastBeat := time.Now()
 		for {
 			select {
 			case <-quit:
@@ -409,10 +485,20 @@ func (a *Agent) heartbeat(ctx context.Context, st *runState) func() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if err := a.checkpoint(ctx, st); errors.Is(err, ErrLockLost) {
-					st.cancel(ErrLockLost)
-					return
-				}
+			}
+			if time.Since(lastBeat) >= beatEvery {
+				lastBeat = time.Now()
+				_, _ = a.store.Exec(st.db, "UPDATE agent_sessions SET updated_at = ? WHERE id = ? AND run_id = ?", nowMillis(), a.sessionID, st.runID)
+			}
+			owner, status, err := a.sessionLock(st.db)
+			switch {
+			case err != nil:
+			case owner != st.runID:
+				st.cancel(ErrLockLost)
+				return
+			case status == StatusStopping:
+				st.cancel(ErrStopped)
+				return
 			}
 		}
 	}()
@@ -485,15 +571,25 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 	}
 	interrupted := err != nil && runCtx.Err() != nil
 	stopped := interrupted && errors.Is(context.Cause(runCtx), ErrStopped)
+	if !stopped {
+		// Stop may have landed just as the run ended on its own; honour it.
+		if owner, status, lerr := a.sessionLock(st.db); lerr == nil && owner == st.runID && status == StatusStopping {
+			stopped = true
+		}
+	}
 	if stopped {
 		// A requested stop is a normal outcome, not an error.
 		err = nil
 	}
 	var bookErr error // bookkeeping failures while wrapping up
-	if interrupted {
+	if stopped || interrupted {
 		open, oerr := openCalls(st.db, a.store, a.sessionID)
 		if oerr == nil {
-			oerr = a.cancelCalls(runCtx, st, open, "cancelled: the agent was stopped before this call ran")
+			if stopped {
+				oerr = a.cancelCalls(runCtx, st, open, true, errStoppedNotRun)
+			} else {
+				oerr = a.cancelCalls(runCtx, st, open, false, &RPCError{Code: CodeCancelled, Message: "cancelled before this call ran: " + context.Cause(runCtx).Error()})
+			}
 		}
 		bookErr = errors.Join(bookErr, oerr)
 	}
@@ -526,6 +622,11 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 	return res, err
 }
 
+var (
+	errStoppedNotRun  = &RPCError{Code: CodeCancelled, Message: "stopped by user: this call was not executed"}
+	errStoppedRunning = &RPCError{Code: CodeCancelled, Message: "stopped by user while this call was running; it may or may not have taken effect"}
+)
+
 // acquire atomically moves the session to running if it is in one of the
 // allowed states, or if a previous run stopped heartbeating (crash).
 func (a *Agent) acquire(ctx context.Context, from []Status) (string, error) {
@@ -535,10 +636,10 @@ func (a *Agent) acquire(ctx context.Context, from []Status) (string, error) {
 	for _, s := range from {
 		args = append(args, string(s))
 	}
-	args = append(args, string(StatusRunning), now-a.cfg.StaleAfter.Milliseconds())
+	args = append(args, string(StatusRunning), string(StatusStopping), now-a.cfg.StaleAfter.Milliseconds())
 	ph := strings.TrimSuffix(strings.Repeat("?, ", len(from)), ", ")
 	if _, err := a.store.Exec(ctx,
-		"UPDATE agent_sessions SET status = ?, run_id = ?, stop_requested = 0, last_error = '', updated_at = ? WHERE id = ? AND (status IN ("+ph+") OR (status = ? AND updated_at < ?))",
+		"UPDATE agent_sessions SET status = ?, run_id = ?, last_error = '', updated_at = ? WHERE id = ? AND (status IN ("+ph+") OR (status IN (?, ?) AND updated_at < ?))",
 		args...); err != nil {
 		return "", err
 	}
@@ -555,7 +656,7 @@ func (a *Agent) acquire(ctx context.Context, from []Status) (string, error) {
 		return "", err
 	}
 	switch s.Status {
-	case StatusRunning:
+	case StatusRunning, StatusStopping:
 		return "", ErrBusy
 	case StatusWaitingConfirmation:
 		return "", ErrWaitingConfirmation
@@ -564,21 +665,21 @@ func (a *Agent) acquire(ctx context.Context, from []Status) (string, error) {
 	}
 }
 
-func (a *Agent) sessionLock(ctx context.Context) (runID string, stop bool, err error) {
-	rows, err := a.store.Query(ctx, "SELECT run_id, stop_requested FROM agent_sessions WHERE id = ?", a.sessionID)
+func (a *Agent) sessionLock(ctx context.Context) (runID string, status Status, err error) {
+	rows, err := a.store.Query(ctx, "SELECT run_id, status FROM agent_sessions WHERE id = ?", a.sessionID)
 	if err != nil {
-		return "", false, err
+		return "", "", err
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
-			return "", false, err
+			return "", "", err
 		}
-		return "", false, ErrSessionNotFound
+		return "", "", ErrSessionNotFound
 	}
-	var flag int64
-	err = rows.Scan(&runID, &flag)
-	return runID, flag != 0, err
+	var st string
+	err = rows.Scan(&runID, &st)
+	return runID, Status(st), err
 }
 
 // checkpoint heartbeats the lock and honours stop requests.
@@ -589,14 +690,14 @@ func (a *Agent) checkpoint(ctx context.Context, st *runState) error {
 	if _, err := a.store.Exec(st.db, "UPDATE agent_sessions SET updated_at = ? WHERE id = ? AND run_id = ?", nowMillis(), a.sessionID, st.runID); err != nil {
 		return err
 	}
-	owner, stop, err := a.sessionLock(st.db)
+	owner, status, err := a.sessionLock(st.db)
 	if err != nil {
 		return err
 	}
 	if owner != st.runID {
 		return ErrLockLost
 	}
-	if stop {
+	if status == StatusStopping {
 		st.cancel(ErrStopped)
 		return ErrStopped
 	}
@@ -617,7 +718,7 @@ func (a *Agent) ownsLock(st *runState) error {
 }
 
 func (a *Agent) release(st *runState, status Status, lastErr string) error {
-	_, err := a.store.Exec(st.db, "UPDATE agent_sessions SET status = ?, run_id = '', stop_requested = 0, last_error = ?, updated_at = ? WHERE id = ? AND run_id = ?",
+	_, err := a.store.Exec(st.db, "UPDATE agent_sessions SET status = ?, run_id = '', last_error = ?, updated_at = ? WHERE id = ? AND run_id = ?",
 		string(status), lastErr, nowMillis(), a.sessionID, st.runID)
 	return err
 }
@@ -665,7 +766,9 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 }
 
 // execute runs one call. The tool message is marked "running" before the
-// handler starts, so a crash mid-call is visible and recoverable.
+// handler starts, so a crash mid-call is visible and recoverable. If the run
+// is stopped meanwhile, the call is closed at once without waiting for the
+// handler, whose late result is discarded.
 func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 	if err := a.checkpoint(ctx, st); err != nil {
 		return err
@@ -674,11 +777,34 @@ func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 		return err
 	}
 	a.notify(ctx, st, c.ResultMessageID)
-	result := a.invoke(ctx, c)
+	done := make(chan json.RawMessage, 1)
+	go func() { done <- a.invoke(ctx, c) }()
+	status := CallDone
+	var result json.RawMessage
+	select {
+	case result = <-done:
+	case <-ctx.Done():
+		select {
+		case result = <-done: // finished at the same instant: keep the real result
+		default:
+			status = CallCancelled
+			rerr := errStoppedRunning
+			if !errors.Is(context.Cause(ctx), ErrStopped) {
+				rerr = &RPCError{Code: CodeCancelled, Message: "cancelled while this call was running (" + context.Cause(ctx).Error() + "); it may or may not have taken effect"}
+			}
+			result = rpcErrorResponse(c.RPCID, rerr)
+		}
+	}
 	if err := a.ownsLock(st); err != nil {
 		return err // the session was recovered meanwhile; do not overwrite it
 	}
-	return a.completeCall(ctx, st, c, CallDone, result)
+	if err := a.completeCall(ctx, st, c, status, result); err != nil {
+		return err
+	}
+	if status == CallCancelled {
+		return context.Cause(ctx)
+	}
+	return nil
 }
 
 func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
@@ -743,14 +869,21 @@ func (a *Agent) completeCall(ctx context.Context, st *runState, c *RPCCall, stat
 	return nil
 }
 
-// cancelCalls closes calls that never started with a cancellation error.
-func (a *Agent) cancelCalls(ctx context.Context, st *runState, open []RPCCall, reason string) error {
+// cancelCalls closes calls that never started with rerr. Calls awaiting
+// confirmation are closed too when includeAwaiting is set (Stop).
+func (a *Agent) cancelCalls(ctx context.Context, st *runState, open []RPCCall, includeAwaiting bool, rerr *RPCError) error {
 	for i := range open {
 		c := &open[i]
-		if c.Status != CallQueued && c.Status != CallApproved {
+		switch c.Status {
+		case CallQueued, CallApproved:
+		case CallAwaitingConfirmation:
+			if !includeAwaiting {
+				continue
+			}
+		default:
 			continue
 		}
-		if err := a.completeCall(ctx, st, c, CallCancelled, rpcErrorResponse(c.RPCID, &RPCError{Code: CodeCancelled, Message: reason})); err != nil {
+		if err := a.completeCall(ctx, st, c, CallCancelled, rpcErrorResponse(c.RPCID, rerr)); err != nil {
 			return err
 		}
 	}
@@ -840,13 +973,19 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 		req.MaxTokens = maxTokens
 	}
 
+	// Deltas arrive on this goroutine; a trailing timer flushes buffered text
+	// when the stream stalls, so the store never lags more than one interval.
 	var (
+		mu                 sync.Mutex
 		msg                *Message
 		content, reasoning strings.Builder
 		lastFlush          time.Time
+		timer              *time.Timer
+		dirty, ended       bool
+		flushErr           error
 	)
-	flush := func(status MessageStatus, raw json.RawMessage) error {
-		lastFlush = time.Now()
+	flush := func(status MessageStatus, raw json.RawMessage) error { // mu held
+		lastFlush, dirty = time.Now(), false
 		if msg == nil {
 			m := newMessage(a.sessionID, raw, status)
 			m.Reasoning = reasoning.String()
@@ -858,21 +997,47 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	}
 	partial := func() json.RawMessage { return a.assistantRaw(content.String(), "", nil) }
 	onDelta := func(dc, dr string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if flushErr != nil {
+			return flushErr
+		}
 		content.WriteString(dc)
 		reasoning.WriteString(dr)
-		if msg == nil || time.Since(lastFlush) >= a.cfg.StreamFlushInterval {
+		dirty = true
+		if wait := a.cfg.StreamFlushInterval - time.Since(lastFlush); msg == nil || wait <= 0 {
 			if err := flush(MessageStreaming, partial()); err != nil {
 				return err
 			}
+		} else if timer == nil {
+			timer = time.AfterFunc(wait, func() {
+				mu.Lock()
+				defer mu.Unlock()
+				timer = nil
+				if dirty && !ended {
+					flushErr = flush(MessageStreaming, partial())
+				}
+			})
 		}
 		if a.cfg.OnStream != nil {
 			a.cfg.OnStream(ctx, msg.ID, dc, dr)
 		}
 		return nil
 	}
+	endStream := func() { // stop the trailing timer; afterwards only this goroutine touches state
+		mu.Lock()
+		ended = true
+		if timer != nil {
+			timer.Stop()
+		}
+		mu.Unlock()
+	}
 
 	start := time.Now()
 	res, err := a.llm.stream(ctx, req, a.cfg.ExtraBody, onDelta)
+	endStream()
+	mu.Lock() // pairs with a timer callback that may have just run
+	defer mu.Unlock()
 	if err != nil {
 		if msg != nil {
 			// Keep what was generated; partial tool calls are dropped.
