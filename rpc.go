@@ -28,17 +28,52 @@ const (
 // message is shown to the model.
 type Handler func(ctx context.Context, call *Call) (any, error)
 
-// Method is an RPC method exposed to the model.
+// Method is an RPC method exposed to the model. NewMethod builds one from a
+// typed function and derives Params from the params struct automatically.
 type Method struct {
-	Name        string
+	Name string
+	// Description is a one-line summary.
 	Description string
-	// Params optionally documents the params as a JSON Schema (map, struct or
+	// Doc is a longer, free-form explanation: business rules, call order,
+	// caveats. It may span several lines.
+	Doc string
+	// Params documents the params as a JSON Schema (map, struct or
 	// json.RawMessage). It is shown to the model; validation is up to Handler.
+	// ParamsSchema generates one from a struct.
 	Params any
+	// Result describes what the method returns.
+	Result string
+	// Examples are example params, each a JSON value such as `{"id":"A-1"}`.
+	Examples []string
 	// RequireConfirm pauses the agent before running this method until the
 	// caller approves or rejects it with Agent.Confirm.
 	RequireConfirm bool
 	Handler        Handler
+}
+
+// MethodDoc is the documentation part of a Method, used by NewMethod.
+type MethodDoc struct {
+	Description    string
+	Doc            string
+	Result         string
+	Examples       []string
+	RequireConfirm bool
+}
+
+// NewMethod builds a Method from a typed function. Params are decoded and
+// validated as with Typed, and the params JSON Schema shown to the model is
+// generated from P's fields and struct tags (see ParamsSchema).
+func NewMethod[P any, R any](name string, fn func(ctx context.Context, call *Call, params P) (R, error), doc MethodDoc) Method {
+	return Method{
+		Name:           name,
+		Description:    doc.Description,
+		Doc:            doc.Doc,
+		Params:         ParamsSchema[P](),
+		Result:         doc.Result,
+		Examples:       doc.Examples,
+		RequireConfirm: doc.RequireConfirm,
+		Handler:        Typed(fn),
+	}
 }
 
 // Call is the invocation context passed to a Handler.
@@ -288,6 +323,18 @@ func (a *Agent) buildSystemPrompt() (string, error) {
 			}
 			fmt.Fprintf(&b, "  params: %s\n", schema)
 		}
+		if r := strings.TrimSpace(m.Result); r != "" {
+			fmt.Fprintf(&b, "  returns: %s\n", indent(r))
+		}
+		for _, ex := range m.Examples {
+			if !json.Valid([]byte(ex)) {
+				return "", fmt.Errorf("agent: method %q example is not valid JSON: %s", name, ex)
+			}
+			fmt.Fprintf(&b, "  example params: %s\n", ex)
+		}
+		if d := strings.TrimSpace(m.Doc); d != "" {
+			fmt.Fprintf(&b, "  %s\n", indent(d))
+		}
 	}
 	if doc := strings.TrimSpace(a.cfg.RPCDoc); doc != "" {
 		b.WriteString("\n## Documentation\n")
@@ -295,4 +342,9 @@ func (a *Agent) buildSystemPrompt() (string, error) {
 		b.WriteString("\n")
 	}
 	return b.String(), nil
+}
+
+// indent indents continuation lines so multi-line text stays under its method.
+func indent(s string) string {
+	return strings.ReplaceAll(s, "\n", "\n  ")
 }

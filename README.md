@@ -43,8 +43,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// 入参说明写在结构体标签里：desc 说明、enum 枚举、omitempty/指针表示可选
 type GetOrderParams struct {
-	OrderID string `json:"order_id"`
+	OrderID string `json:"order_id" desc:"订单号，如 ORD-123"`
 }
 
 // 可选：实现 Validate，校验失败会以 -32602 invalid params 返回给模型
@@ -53,6 +54,12 @@ func (p GetOrderParams) Validate() error {
 		return errors.New("order_id is required")
 	}
 	return nil
+}
+
+type RefundParams struct {
+	OrderID string  `json:"order_id" desc:"订单号"`
+	Mode    string  `json:"mode" enum:"full,partial" desc:"全额或部分退款"`
+	Amount  float64 `json:"amount,omitempty" desc:"部分退款金额（元）"`
 }
 
 func main() {
@@ -82,37 +89,25 @@ func main() {
 		Store:           store,
 		Billing:         agent.Pricing{Input: 100, Output: 1000, CacheRead: 10}, // 每百万 token 的积分
 		Methods: []agent.Method{
-			{
-				Name:        "get_order",
+			// NewMethod 从 GetOrderParams 自动生成参数说明，并自动解码 + 校验 params
+			agent.NewMethod("get_order", func(ctx context.Context, call *agent.Call, p GetOrderParams) (any, error) {
+				userID := call.Value("user_id") // 读取当前会话的上下文参数
+				return map[string]any{"order_id": p.OrderID, "owner": userID, "status": "delivered"}, nil
+			}, agent.MethodDoc{
 				Description: "查询当前用户的订单",
-				Params: map[string]any{ // 可选：JSON Schema，会写进系统提示词给模型看
-					"type":       "object",
-					"properties": map[string]any{"order_id": map[string]any{"type": "string"}},
-					"required":   []string{"order_id"},
-				},
-				Handler: agent.Typed(func(ctx context.Context, call *agent.Call, p GetOrderParams) (any, error) {
-					userID := call.Value("user_id") // 读取当前会话的上下文参数
-					return map[string]any{"order_id": p.OrderID, "owner": userID, "status": "delivered"}, nil
-				}),
-			},
-			{
-				Name:           "refund_order",
+				Result:      `{"order_id": string, "status": string}`,
+			}),
+			agent.NewMethod("refund_order", func(ctx context.Context, call *agent.Call, p RefundParams) (any, error) {
+				if p.Mode == "partial" && p.Amount <= 0 {
+					return nil, agent.InvalidParams("partial refund needs a positive amount")
+				}
+				return map[string]any{"refunded": p.Amount}, nil
+			}, agent.MethodDoc{
 				Description:    "给订单退款",
+				Doc:            "退款前必须先调用 get_order 确认订单金额。\n部分退款金额不能超过订单金额。",
+				Examples:       []string{`{"order_id":"ORD-1","mode":"partial","amount":10}`},
 				RequireConfirm: true, // 需要确认才执行
-				Handler: func(ctx context.Context, call *agent.Call) (any, error) {
-					var p struct {
-						OrderID string  `json:"order_id"`
-						Amount  float64 `json:"amount"`
-					}
-					if err := call.Bind(&p); err != nil { // 严格解码，未知字段也会报错
-						return nil, err
-					}
-					if p.Amount <= 0 {
-						return nil, agent.InvalidParams("amount must be positive")
-					}
-					return map[string]any{"refunded": p.Amount}, nil
-				},
-			},
+			}),
 		},
 	})
 	if err != nil {
@@ -205,16 +200,66 @@ agent.ResetSession(ctx, store, sid)                     // 进程崩溃后强制
 {"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"order_id is required"}}
 ```
 
-方法列表（名字、描述、参数 schema、是否需要确认）和 `RPCDoc` 会自动拼到系统提示词后面。
+#### 注册方法（推荐 `agent.NewMethod`）
 
-注册方法有两种写法：
+Go 没有注解，也无法在运行时读取注释；入参说明写在**结构体标签**里，SDK 通过反射自动生成 JSON Schema：
 
 ```go
-// 1. 泛型：自动解码 params 到结构体（严格模式，拒绝未知字段），可选 Validate() error
-agent.Typed(func(ctx context.Context, call *agent.Call, p MyParams) (MyResult, error) { ... })
+type RefundParams struct {
+	OrderID string   `json:"order_id" desc:"订单号，如 ORD-123"`
+	Mode    string   `json:"mode" enum:"full,partial" desc:"全额或部分退款"`
+	Amount  float64  `json:"amount,omitempty" desc:"部分退款金额（元）"`
+	Items   []Item   `json:"items" required:"false" desc:"部分退款的商品"`
+	Note    *string  `json:"note" desc:"备注"`
+}
+
+agent.NewMethod("refund_order", handler, agent.MethodDoc{
+	Description:    "给订单退款",                          // 一句话简介
+	Doc:            "退款前必须先调用 get_order……\n……",      // 多行详细说明：业务规则、调用顺序
+	Result:         `{"refunded": number}`,                // 返回值说明
+	Examples:       []string{`{"order_id":"ORD-1","mode":"full"}`}, // params 示例（必须是合法 JSON）
+	RequireConfirm: true,
+})
+```
+
+| 标签 | 作用 |
+| --- | --- |
+| `json:"name"` | 参数名；`json:"-"` 跳过；嵌入结构体会被展开，与 `encoding/json` 一致 |
+| `desc:"..."` | 参数说明 |
+| `enum:"a,b,c"` | 可选值（整数 / 浮点 / 布尔字段会转成对应类型） |
+| `required:"true/false"` | 覆盖默认规则。默认：非指针且没有 `omitempty` / `omitzero` 的字段为必填 |
+
+支持 string、bool、整数、浮点、切片 / 数组、`map[string]T`、嵌套结构体、指针、`time.Time`（date-time 字符串）、`encoding.TextMarshaler`（字符串）、`any` / `json.RawMessage`（任意 JSON）。字段按声明顺序输出。
+
+所有方法会被自动整理后拼到系统提示词末尾，最后附上 `Config.RPCDoc`（写多个方法共用的约定）。模型看到的内容类似：
+
+```
+## Methods
+- `refund_order`: 给订单退款 (requires confirmation)
+  params: {"type":"object","properties":{"order_id":{"type":"string","description":"订单号，如 ORD-123"},"mode":{"type":"string","description":"全额或部分退款","enum":["full","partial"]},...},"required":["order_id","mode"]}
+  returns: {"refunded": number}
+  example params: {"order_id":"ORD-1","mode":"full"}
+  退款前必须先调用 get_order……
+
+## Documentation
+<Config.RPCDoc>
+```
+
+说明内容是确定性生成的（方法按名称排序），不会影响前缀缓存。
+
+#### 其他写法
+
+```go
+// 1. 手写 Method：Params 可以是任意 JSON Schema，也可以用 agent.ParamsSchema[T]() 生成
+agent.Method{
+	Name:        "get_order",
+	Description: "查询订单",
+	Params:      agent.ParamsSchema[GetOrderParams](),
+	Handler:     agent.Typed(getOrder), // 泛型：严格解码 params（拒绝未知字段），可选 Validate() error
+}
 
 // 2. 原始 Handler：自己解码 / 校验
-func(ctx context.Context, call *agent.Call) (any, error) {
+Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 	var p MyParams
 	if err := call.Bind(&p); err != nil { return nil, err }
 	...

@@ -19,7 +19,7 @@ import (
 )
 
 type getOrderParams struct {
-	OrderID string `json:"order_id"`
+	OrderID string `json:"order_id" desc:"Order id, e.g. ORD-123"`
 }
 
 func (p getOrderParams) Validate() error {
@@ -30,8 +30,9 @@ func (p getOrderParams) Validate() error {
 }
 
 type refundParams struct {
-	OrderID string  `json:"order_id"`
-	Amount  float64 `json:"amount"`
+	OrderID string  `json:"order_id" desc:"Order id, e.g. ORD-123"`
+	Mode    string  `json:"mode" enum:"full,partial" desc:"Refund the whole order or a part of it"`
+	Amount  float64 `json:"amount,omitempty" desc:"Amount in USD, only for partial refunds"`
 }
 
 func main() {
@@ -59,23 +60,20 @@ func main() {
 		Store:           store,
 		Billing:         agent.Pricing{Input: 100, Output: 1000, CacheRead: 10},
 		Methods: []agent.Method{
-			{
-				Name:        "get_order",
+			agent.NewMethod("get_order", func(ctx context.Context, c *agent.Call, p getOrderParams) (any, error) {
+				return map[string]any{"order_id": p.OrderID, "owner": c.Value("user_id"), "status": "delivered", "total": 59.9}, nil
+			}, agent.MethodDoc{
 				Description: "Get an order of the current user",
-				Params:      map[string]any{"type": "object", "properties": map[string]any{"order_id": map[string]any{"type": "string"}}, "required": []string{"order_id"}},
-				Handler: agent.Typed(func(ctx context.Context, c *agent.Call, p getOrderParams) (any, error) {
-					return map[string]any{"order_id": p.OrderID, "owner": c.Value("user_id"), "status": "delivered", "total": 59.9}, nil
-				}),
-			},
-			{
-				Name:           "refund_order",
+				Result:      `{"order_id": string, "status": string, "total": number}`,
+			}),
+			agent.NewMethod("refund_order", func(ctx context.Context, c *agent.Call, p refundParams) (any, error) {
+				return map[string]any{"refunded": p.Amount}, nil
+			}, agent.MethodDoc{
 				Description:    "Refund an order",
+				Doc:            "Always call get_order first to check the order total.\nA partial refund must not exceed the order total.",
+				Examples:       []string{`{"order_id":"ORD-1","mode":"partial","amount":10}`},
 				RequireConfirm: true,
-				Params:         map[string]any{"type": "object", "properties": map[string]any{"order_id": map[string]any{"type": "string"}, "amount": map[string]any{"type": "number"}}},
-				Handler: agent.Typed(func(ctx context.Context, c *agent.Call, p refundParams) (any, error) {
-					return map[string]any{"refunded": p.Amount}, nil
-				}),
-			},
+			}),
 		},
 	})
 	if err != nil {
