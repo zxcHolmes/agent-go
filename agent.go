@@ -22,6 +22,7 @@ type Agent struct {
 	tools         []json.RawMessage
 	sessionID     string
 	contextParams map[string]any
+	res           *resources
 }
 
 func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOptions) (*Agent, error) {
@@ -32,6 +33,13 @@ func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOption
 	}
 	cfg.Store = c.store
 	cfg = cfg.withDefaults()
+	res := c.res
+	if opts.Override != nil { // the override may point at other files
+		var err error
+		if res, err = loadResources(cfg); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.BaseURL == "" || cfg.Model == "" {
 		return nil, errors.New("agent: Config.BaseURL and Config.Model are required to create an agent")
 	}
@@ -45,6 +53,7 @@ func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOption
 		store:         c.store,
 		methods:       make(map[string]Method, len(cfg.Methods)),
 		contextParams: opts.ContextParams,
+		res:           res,
 		llm: &llmClient{
 			endpoint:    chatEndpoint(cfg.BaseURL),
 			apiKey:      cfg.APIKey,
@@ -74,11 +83,18 @@ func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOption
 			Content string `json:"content"`
 		}{"system", prompt})
 	}
-	if cfg.ViewImage && cfg.ToolName == ViewImageTool {
-		return nil, fmt.Errorf("agent: ToolName %q clashes with the built-in view_image tool", ViewImageTool)
+	if cfg.ToolName == ViewImageTool || cfg.ToolName == ReadDocTool {
+		return nil, fmt.Errorf("agent: ToolName %q clashes with a built-in tool", cfg.ToolName)
 	}
 	if len(a.methods) > 0 {
 		tool, err := a.buildTool()
+		if err != nil {
+			return nil, err
+		}
+		a.tools = append(a.tools, tool)
+	}
+	if len(res.docs) > 0 {
+		tool, err := a.buildReadDocTool()
 		if err != nil {
 			return nil, err
 		}

@@ -3,7 +3,8 @@
 Go agent SDK for OpenAI-compatible chat APIs, imported by other projects as
 `github.com/zxcHolmes/agent-go` (package `agent`, public repo). The model gets a
 single JSON-RPC 2.0 tool (`json_rpc`) that dispatches to Go handlers registered by
-the host app, plus an optional built-in `view_image` tool. Everything (sessions,
+the host app, plus built-in tools: `read_doc` (mounted markdown docs) and optional
+`view_image`. Everything (sessions,
 messages, RPC calls, token usage, billing, queued messages) is persisted through a
 SQL-like `Store`, so sessions can be polled by a frontend, resumed by id and
 recovered after crashes.
@@ -33,6 +34,9 @@ settlement. User-facing docs are in `README.md` (Chinese).
   bytes sent to the model and must not change once final — it is replayed
   byte-for-byte so provider prefix caches keep hitting. Build messages with
   structs (not maps) when key order matters for readability.
+- Built-in tools (`read_doc`, `view_image`) are answered at call creation
+  (`newCall`), never executed by the loop; plain-text results are stored as a JSON
+  string and unquoted into the tool message (`toolContent`).
 - Errors shown to the model are JSON-RPC errors (`rpc.go` codes: -32602 invalid
   params, -32001 rejected, -32002 cancelled/stopped, -32003 crashed). Handler
   errors never abort the loop.
@@ -74,6 +78,8 @@ settlement. User-facing docs are in `README.md` (Chinese).
 - `rpc.go` / `prompt.go` / `jsonschema.go` — Method/Call/Typed/NewMethod, JSON-RPC
   dispatch and result limit, system prompt + tool definition, struct-tag schemas.
 - `viewimage.go` — `view_image` tool and healing of unloadable image URLs.
+- `docs.go` — mounted docs (`Config.Docs` fs.FS, frontmatter parser, `read_doc`
+  paging) and `SystemPromptFile`; loaded once per Client into `resources`.
 - `llm.go` / `stream.go` — HTTP client with retries, SSE parsing/accumulation.
 - `*_store.go`, `session.go`, `schema.go`, `recovery.go` — persistence, DDL,
   crash recovery (`resetSession`).

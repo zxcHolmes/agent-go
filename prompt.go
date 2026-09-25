@@ -32,7 +32,19 @@ func (a *Agent) buildTool() (json.RawMessage, error) {
 // buildSystemPrompt appends the RPC documentation to the configured prompt.
 func (a *Agent) buildSystemPrompt() (string, error) {
 	var b strings.Builder
-	b.WriteString(a.cfg.SystemPrompt)
+	fileP := ""
+	if a.res != nil {
+		fileP = a.res.systemPrompt
+	}
+	for _, part := range []string{fileP, a.cfg.SystemPrompt, a.docsPromptSection()} {
+		if part = strings.TrimRight(part, "\n"); part == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(part)
+	}
 	if len(a.methods) == 0 {
 		return b.String(), nil
 	}

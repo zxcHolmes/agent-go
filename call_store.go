@@ -92,7 +92,7 @@ func completeCall(ctx context.Context, store Store, c *RPCCall, status CallStatu
 	if c.ResultMessageID == "" {
 		return nil
 	}
-	m := Message{ID: c.ResultMessageID, Status: MessageDone, Raw: toolMessageRaw(c.ToolCallID, string(result))}
+	m := Message{ID: c.ResultMessageID, Status: MessageDone, Raw: toolMessageRaw(c.ToolCallID, toolContent(result))}
 	return updateMessage(ctx, store, &m)
 }
 

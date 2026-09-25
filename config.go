@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"io/fs"
 	"net/http"
 	"time"
 )
@@ -50,6 +51,20 @@ type Config struct {
 	// SystemPrompt is prepended to every request. Keep it stable across calls
 	// so the provider prefix cache keeps hitting.
 	SystemPrompt string
+	// SystemPromptFile loads the core system prompt from a markdown file
+	// (frontmatter is stripped), so long prompts stay out of Go code. The path
+	// is inside Docs when Docs is set, otherwise on the local filesystem.
+	// SystemPrompt, if also set, is appended after it.
+	SystemPromptFile string
+	// Docs mounts a tree of markdown documents (e.g. os.DirFS("docs") or an
+	// embed.FS). Each file needs frontmatter with a unique "title" and
+	// usually a "description"; the frontmatter of every document is listed
+	// in the system prompt and the model reads bodies on demand with the
+	// read_doc tool. Loaded once by NewClient.
+	Docs fs.FS
+	// DocPageChars splits long documents into pages of this many characters
+	// for read_doc (default 20000).
+	DocPageChars int
 	// RPCDoc is free-form documentation of your JSON-RPC API, appended to the
 	// system prompt after the auto-generated method list.
 	RPCDoc string
@@ -159,6 +174,9 @@ const (
 )
 
 func (cfg Config) withDefaults() Config {
+	if cfg.DocPageChars <= 0 {
+		cfg.DocPageChars = 20000
+	}
 	if cfg.Compaction == "" {
 		cfg.Compaction = CompactionAnchor
 	}

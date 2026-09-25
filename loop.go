@@ -112,6 +112,10 @@ func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
 		Method: tc.Function.Name, Status: CallQueued, ResultMessageID: newID("msg"), CreatedAt: now, UpdatedAt: now,
 	}
 	fallbackID, _ := marshalJSON(tc.ID)
+	if a.hasDocs() && tc.Function.Name == ReadDocTool {
+		a.newReadDocCall(&c, tc.Function.Arguments)
+		return c
+	}
 	if a.cfg.ViewImage && tc.Function.Name == ViewImageTool {
 		a.newViewImageCall(&c, tc.Function.Arguments)
 		return c
@@ -146,6 +150,9 @@ func (a *Agent) toolNames() []string {
 	if len(a.methods) > 0 {
 		names = append(names, a.cfg.ToolName)
 	}
+	if a.hasDocs() {
+		names = append(names, ReadDocTool)
+	}
 	if a.cfg.ViewImage {
 		names = append(names, ViewImageTool)
 	}
@@ -162,7 +169,7 @@ func (a *Agent) toolMessage(c *RPCCall) Message {
 		status = MessageRunning
 	}
 	if c.Status.finished() {
-		status, content = MessageDone, string(c.Result)
+		status, content = MessageDone, toolContent(c.Result)
 	}
 	return newMessage(a.sessionID, toolMessageRaw(c.ToolCallID, content), status)
 }

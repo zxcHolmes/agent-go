@@ -13,6 +13,7 @@ import (
 type Client struct {
 	cfg   Config
 	store Store
+	res   *resources // mounted docs and the system prompt file
 }
 
 // NewClient validates cfg, creates the tables (unless cfg.SkipSchema) and
@@ -22,7 +23,11 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("agent: Config.Store is required")
 	}
-	c := &Client{cfg: cfg, store: cfg.Store}
+	res, err := loadResources(cfg)
+	if err != nil {
+		return nil, err
+	}
+	c := &Client{cfg: cfg, store: cfg.Store, res: res}
 	if !cfg.SkipSchema {
 		if err := migrate(ctx, c.store); err != nil {
 			return nil, err
@@ -44,6 +49,11 @@ func (c *Client) Recover(ctx context.Context) error {
 // empty (read it back with Agent.SessionID).
 func (c *Client) Agent(ctx context.Context, sessionID string, opts AgentOptions) (*Agent, error) {
 	return newAgent(ctx, c, sessionID, opts)
+}
+
+// Docs lists the mounted documents (Config.Docs), sorted by title.
+func (c *Client) Docs() []Doc {
+	return append([]Doc(nil), c.res.docs...)
 }
 
 // ---- sessions ----

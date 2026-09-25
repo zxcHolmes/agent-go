@@ -7,6 +7,7 @@
 - 消息按原始 JSON 字节完整保存并原样回放，保证大模型**前缀缓存**不丢失。
 - **流式输出**：助手消息边生成边写库（默认每 2 秒刷新一次，可配置），前端轮询数据库即可拿到实时内容。
 - 支持需要人工确认的 RPC 方法、Stop / Continue、跨进程的会话锁。
+- **文档挂载**：挂载一个 markdown 文档目录，文档目录（frontmatter）进系统提示词，模型用 `read_doc` 按需查阅；系统提示词也可以从文件加载。
 - **上下文压缩**（默认“固定上个用户消息起点”，可选摘要模式）、运行中**追加用户消息队列**、每条用户消息附加 **reminder**、RPC 结果**长度保护**。
 - **崩溃恢复**：进程挂掉后，`NewClient` 启动时会把卡住的会话、写了一半的消息、执行中的工具调用恢复成一致状态，可以直接继续对话。
 
@@ -344,6 +345,44 @@ Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 
 所有这些错误都只回给模型，不会中断 agent loop，模型可以自行修正后重试。
 
+### 文档挂载（read_doc）与系统提示词文件
+
+挂载一个 markdown 文档目录，模型会按需查阅：
+
+```go
+//go:embed docs
+var docsFS embed.FS
+
+sub, _ := fs.Sub(docsFS, "docs")
+client, _ := agent.NewClient(ctx, agent.Config{
+	// ...
+	Docs:             sub,                 // 或 os.DirFS("./docs")
+	SystemPromptFile: "prompts/system.md", // 核心系统提示词放在文件里，而不是写在代码中
+	DocPageChars:     20000,               // 长文档分页，默认 20000 字符一页
+})
+client.Docs() // 已挂载的文档列表
+```
+
+每个文档开头是 frontmatter，`title` 必填且**不能重复**（不区分大小写），其他字段可选：
+
+```markdown
+---
+title: Refund policy
+description: 退款时限、部分退款和例外情况
+audience: customers
+---
+# 退款
+……
+```
+
+- 递归扫描目录下所有 `.md` / `.markdown` 文件，在 `NewClient` 时加载一次。缺少 title、title 重复或文件读不到时，`NewClient` 直接报错（fail fast）。
+- 所有文档的 frontmatter（title、description 和其他字段）按标题排序后写进系统提示词。**正文不会放进上下文**，模型需要时调用内置工具 `read_doc`，参数为 `{"title": "...", "page": 2}`。标题匹配不区分大小写，标题不存在时会返回错误，提示模型从列表里选。
+- `read_doc` 返回纯文本（`# 标题` + 正文，去掉 frontmatter）。超过 `DocPageChars` 的文档会优先在段落处分页，结果里会注明第几页、共几页，以及怎么读下一页。
+- `SystemPromptFile`：设置了 `Docs` 时是 Docs 里的相对路径，否则是本地文件路径。frontmatter 会被去掉，这个文件本身不会出现在文档列表中。同时设置了 `SystemPrompt` 字符串时，追加在文件内容之后。
+- 系统提示词的顺序：提示词文件 → `SystemPrompt` → 文档列表 → RPC 方法说明，整体稳定不变，不影响前缀缓存。修改文档后需要重新创建 Client 才会生效。
+
+实测：挂载 5 个文档，模型能为每个问题选对文档；一本 4 页的手册，它会逐页翻到最后一页找到答案；文档里没有的问题，它会明确说“文档中没有”。
+
 ### 查看图片（view_image）
 
 开启 `Config.ViewImage` 后，除了 `json_rpc`，模型还会多一个内置工具 `view_image`，参数只有一个 `url`。适合让模型查看用户发来的图片链接，或者某个 RPC 方法返回的图片地址。
@@ -601,6 +640,7 @@ type Store interface {
 | 字段 | 说明 |
 | --- | --- |
 | `ViewImage` / `ViewImageDetail` | 开启内置的 `view_image` 工具 / 设置 `image_url.detail`，见“查看图片” |
+| `Docs` / `SystemPromptFile` / `DocPageChars` | 挂载文档目录 / 从文件加载系统提示词 / 文档分页大小，见“文档挂载” |
 | `Compaction` / `CompactionThreshold` / `CompactionPrompt` | 上下文压缩策略 / 触发比例（默认 0.8）/ 摘要提示词，见“上下文压缩” |
 | `Reminder` | 附加在每条用户消息后的 `<reminder>` 内容 |
 | `MaxRPCResultChars` | 单次 RPC 返回给模型的最大字符数（按字符计，中文不会被截成乱码）。超出部分会被截掉，并附上说明省略了多少字符；返回内容仍是合法 JSON。0 表示不限制 |
