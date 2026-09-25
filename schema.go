@@ -90,6 +90,7 @@ func tableDefs(text string) []tableDef {
 				"session_id VARCHAR(64) NOT NULL",
 				"content " + text + " NOT NULL",
 				"raw " + text + " NOT NULL",
+				"status VARCHAR(16) NOT NULL",
 				"created_at BIGINT NOT NULL",
 			},
 			indexes: [][2]string{{"idx_agent_queued_messages_session", "session_id, created_at"}},

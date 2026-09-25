@@ -25,11 +25,16 @@ type runState struct {
 
 // run acquires the session and drives it. With loop=false it only heals the
 // session and stops it (used by Stop).
+//
+// Once the session is acquired the run no longer follows the caller's ctx
+// (only its values): a run is ended by Stop, not by the request that started
+// it going away.
 func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Context, *runState) error, loop bool) (*RunResult, error) {
 	runID, err := a.acquire(ctx, from)
 	if err != nil {
 		return nil, err
 	}
+	ctx = context.WithoutCancel(ctx)
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	lr := &localRun{runID: runID, cancel: cancel}
@@ -217,7 +222,7 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 		status = StatusWaitingConfirmation
 	}
 	lastErr := ""
-	if err != nil && !errors.Is(err, ErrWaitingConfirmation) && !errors.Is(err, errNothingQueued) {
+	if err != nil && !errors.Is(err, ErrWaitingConfirmation) {
 		lastErr = err.Error()
 	}
 	bookErr = errors.Join(bookErr, a.release(st, status, lastErr))
@@ -239,12 +244,9 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 	attrs := []any{"session", a.sessionID, "run", st.runID, "status", string(res.Status), "stop_reason", string(res.StopReason),
 		"duration_ms", time.Since(st.start).Milliseconds(), "prompt_tokens", res.Usage.PromptTokens,
 		"completion_tokens", res.Usage.CompletionTokens, "credits", res.Cost.Total}
-	switch {
-	case errors.Is(err, errNothingQueued):
-		a.log.Debug("send found its message already answered", attrs...)
-	case err != nil:
+	if err != nil {
 		a.log.Warn("run finished with error", append(attrs, "error", err)...)
-	default:
+	} else {
 		a.log.Info("run finished", attrs...)
 	}
 	return res, err

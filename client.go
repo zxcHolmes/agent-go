@@ -158,12 +158,16 @@ func (c *Client) EnqueueMessage(ctx context.Context, sessionID string, raw json.
 	return enqueue(ctx, c.store, sessionID, raw)
 }
 
-// QueuedMessages lists the messages of a session still waiting in the queue.
+// QueuedMessages lists the messages of a session still waiting in the queue
+// (the ones CancelQueued can still withdraw).
 func (c *Client) QueuedMessages(ctx context.Context, sessionID string) ([]QueuedMessage, error) {
-	return queuedMessages(ctx, c.store, sessionID)
+	return queuedMessages(ctx, c.store, sessionID, queueWaiting)
 }
 
-// CancelQueued removes a message from the queue if it has not been sent yet.
+// CancelQueued withdraws a queued message before it is sent. It returns
+// ErrQueuedMessageSent when a run has already taken the message into the
+// conversation (the model sees it), and nil when the message is gone from
+// the queue: withdrawn now, or earlier, or an unknown id.
 func (c *Client) CancelQueued(ctx context.Context, sessionID, queueID string) error {
 	return cancelQueued(ctx, c.store, sessionID, queueID)
 }

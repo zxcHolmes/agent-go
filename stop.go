@@ -6,22 +6,26 @@ import (
 	"time"
 )
 
-// Stop stops the session and blocks until it is idle. It is idempotent and
+// Stop asks the session to stop and returns without waiting for the run to
+// end; poll the session status to see it become idle. It is idempotent and
 // safe to call concurrently, from any process sharing the store.
 //
-//   - running: the session turns "stopping"; the run is interrupted at once. A
+//   - running: the session turns "stopping" and the run is interrupted (at
+//     once in this process, within Config.StopPollInterval in another). A
 //     streaming answer is cut off and keeps its partial text ("interrupted"),
 //     the LLM request is cancelled, a running RPC call is abandoned without
 //     waiting for its handler (the handler's ctx is cancelled and its eventual
 //     result discarded), and every unfinished call, including calls awaiting
-//     confirmation, gets a "stopped by user" error result.
-//   - waiting_confirmation: pending calls get "stopped by user".
-//   - stopping: waits for the stop in progress.
-//   - idle: returns nil immediately.
+//     confirmation, gets a "stopped by user" error result. The run then
+//     leaves the session idle.
+//   - waiting_confirmation: pending calls get "stopped by user" before Stop
+//     returns; the session is idle.
+//   - stopping, idle: returns nil.
 //
 // A run whose process died (no heartbeat for Config.StaleAfter) is taken over
-// and cleaned up by Stop itself. If ctx ends first, Stop returns its error;
-// the session still finishes stopping on its own.
+// and cleaned up by Stop itself, so the session is idle when it returns. A
+// dead run that is not stale yet stays "stopping" until the next run or
+// NewClient's recovery takes it over.
 func (a *Agent) Stop(ctx context.Context) error {
 	a.log.Info("stop requested", "session", a.sessionID)
 	for {
@@ -33,36 +37,40 @@ func (a *Agent) Stop(ctx context.Context) error {
 		case StatusIdle:
 			return nil
 		case StatusWaitingConfirmation:
-			if err := a.stopIdle(ctx); err != nil && !errors.Is(err, ErrBusy) && !errors.Is(err, ErrNoPendingCalls) {
+			err := a.stopIdle(ctx)
+			if errors.Is(err, ErrBusy) {
+				continue // a run started meanwhile (e.g. Confirm): stop that one
+			}
+			if err != nil && !errors.Is(err, ErrNoPendingCalls) {
 				return err
 			}
-			continue // re-read: someone may have raced us
+			return nil
 		case StatusRunning, StatusStopping:
-			if s.Status == StatusRunning {
-				// updated_at is left alone so a dead run still looks stale.
-				if _, err := a.store.Exec(ctx, "UPDATE agent_sessions SET status = ? WHERE id = ? AND status = ?",
-					string(StatusStopping), a.sessionID, string(StatusRunning)); err != nil {
+			if time.Since(s.UpdatedAt) > a.cfg.StaleAfter {
+				// The owning process is gone: take over and clean up here.
+				err := a.stopIdle(ctx)
+				if errors.Is(err, ErrBusy) {
+					continue // someone else took it over first
+				}
+				if err != nil && !errors.Is(err, ErrNoPendingCalls) {
 					return err
 				}
+				return nil
+			}
+			if s.Status == StatusStopping {
+				return nil
+			}
+			// updated_at is left alone so a dead run still looks stale.
+			if _, err := a.store.Exec(ctx, "UPDATE agent_sessions SET status = ? WHERE id = ? AND status = ?",
+				string(StatusStopping), a.sessionID, string(StatusRunning)); err != nil {
+				return err
 			}
 			if v, ok := running.Load(a.sessionID); ok {
 				v.(*localRun).cancel(ErrStopped)
 			}
-			if time.Since(s.UpdatedAt) > a.cfg.StaleAfter {
-				// The owning process is gone: take over and clean up here.
-				if err := a.stopIdle(ctx); err != nil && !errors.Is(err, ErrBusy) && !errors.Is(err, ErrNoPendingCalls) {
-					return err
-				}
-				continue
-			}
+			continue // re-read: the run may have ended or started waiting for confirmation
 		}
-		t := time.NewTimer(20 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return context.Cause(ctx)
-		case <-t.C:
-		}
+		return nil
 	}
 }
 

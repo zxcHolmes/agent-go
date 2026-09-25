@@ -104,6 +104,8 @@ var (
 	ErrStopped               = errors.New("agent: stopped")
 	ErrLockLost              = errors.New("agent: session was taken over by another run")
 	ErrContextLengthExceeded = errors.New("agent: conversation exceeds the model context length")
+	ErrQueuedMessageSent     = errors.New("agent: queued message was already sent to the model")
+	ErrInvalidUserMessage    = errors.New("agent: invalid user message")
 )
 
 // Session is a persisted conversation.

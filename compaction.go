@@ -106,10 +106,31 @@ func (a *Agent) estimateTokens(st *runState, window []Message, marker *Message) 
 	}
 	for _, m := range window {
 		if m.Seq > afterSeq {
-			est += len(m.Raw)/3 + 4
+			est += messageTokens(m.Raw)
 		}
 	}
 	return est, nil
+}
+
+// imageTokens is the flat estimate for one image_url part.
+const imageTokens = 500
+
+// messageTokens estimates one message: ~3 bytes per token for its JSON,
+// except image URLs, which count as imageTokens each whatever their length.
+func messageTokens(raw json.RawMessage) int {
+	n := len(raw)
+	var m struct {
+		Content []userContentPart `json:"content"`
+	}
+	if json.Unmarshal(raw, &m) == nil {
+		for _, p := range m.Content {
+			if p.Type == "image_url" && p.ImageURL != nil {
+				n -= len(p.ImageURL.URL)
+				n += imageTokens * 3
+			}
+		}
+	}
+	return n/3 + 4
 }
 
 func (a *Agent) needsCompaction(est int) bool {

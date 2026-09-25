@@ -3,6 +3,7 @@ package examples
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,51 @@ func TestQueueWhileIdleAndCancel(t *testing.T) {
 	// Queued before the new prompt, cancelled one gone.
 	if got := strings.Join(requestShape(e.llm.request(0))[1:], " | "); got != "user:queued earlier | user:now" {
 		t.Fatalf("%s (kept %s)", got, idKeep)
+	}
+}
+
+// A message the run already took can no longer be withdrawn, and the caller
+// is told so instead of a silent success.
+func TestCancelQueuedAfterSent(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	id, _ := a.Enqueue(ctx, "sent before cancel")
+	e.llm.push(text("ok"))
+	if _, err := a.Chat(ctx, "now"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.CancelQueued(ctx, id); !errors.Is(err, agent.ErrQueuedMessageSent) {
+		t.Fatalf("want ErrQueuedMessageSent, got %v", err)
+	}
+	// Unknown / already withdrawn ids are a no-op.
+	if err := a.CancelQueued(ctx, "q_unknown"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A row claimed by a run (taken, message not written yet) cannot be withdrawn;
+// if that run crashed, the next run still sends it exactly once.
+func TestCancelQueuedWhileTaken(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	id, _ := a.Enqueue(ctx, "claimed by a run")
+	if _, err := e.store.Exec(ctx, "UPDATE agent_queued_messages SET status = 'taken' WHERE id = ?", id); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.CancelQueued(ctx, id); !errors.Is(err, agent.ErrQueuedMessageSent) {
+		t.Fatalf("want ErrQueuedMessageSent, got %v", err)
+	}
+	if qs, _ := e.client.QueuedMessages(ctx, a.SessionID()); len(qs) != 0 {
+		t.Fatalf("taken message still listed as withdrawable: %+v", qs)
+	}
+	e.llm.push(text("ok"))
+	if _, err := a.Chat(ctx, "now"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(requestShape(e.llm.request(0))[1:], " | "); got != "user:claimed by a run | user:now" {
+		t.Fatal(got)
 	}
 }
 

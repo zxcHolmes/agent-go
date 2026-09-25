@@ -162,7 +162,7 @@ agent.SchemaStatements(agent.Postgres)                 // 只要 DDL，交给自
 
 sid, _ := client.CreateSession(ctx, metadata)          // 创建会话，返回 session id
 s, _ := client.Session(ctx, sid)                       // 会话状态、last_error、metadata
-client.Stop(ctx, sid)                                  // 不创建 agent 也能停止会话（比如“停止”按钮的接口）
+client.Stop(ctx, sid)                                  // 不创建 agent 也能停止会话（比如“停止”按钮的接口），不等待
 client.PendingCalls(ctx, sid)                          // 待确认的 RPC 调用
 client.Enqueue(ctx, sid, "补充一点……")                 // 运行中追加用户消息（见“消息队列”）
 client.ResetSession(ctx, sid)                          // 手动恢复单个会话（见“异常恢复”）
@@ -170,7 +170,7 @@ client.DeleteSession(ctx, sid)                         // 删除会话（见下�
 client.Recover(ctx)                                    // 重新执行一次启动时的崩溃恢复
 ```
 
-**删除会话**：`client.DeleteSession` 会永久删除会话本身、所有消息、RPC 调用记录和队列消息。token 用量和计费记录（`agent_llm_calls`）会**保留**：它们只包含 token 数和积分，不含对话内容，保留下来是为了让未结算的用量仍然可以结算。运行中或停止中的会话会返回 `ErrBusy`，需要先 `Stop`；会话不存在时返回 `ErrSessionNotFound`。SDK 不提供按用户查询会话的功能，session id 由调用方自己保存。
+**删除会话**：`client.DeleteSession` 会永久删除会话本身、所有消息、RPC 调用记录和队列消息。token 用量和计费记录（`agent_llm_calls`）会**保留**：它们只包含 token 数和积分，不含对话内容，保留下来是为了让未结算的用量仍然可以结算。运行中或停止中的会话会返回 `ErrBusy`，需要先 `Stop` 并等会话变为 `idle`；会话不存在时返回 `ErrSessionNotFound`。SDK 不提供按用户查询会话的功能，session id 由调用方自己保存。
 
 `Config` 里的大模型配置（`BaseURL`、`Model` 等）只在创建 agent 时需要。只用来查消息、做结算的服务，传一个 `Store` 就够了。
 
@@ -193,14 +193,14 @@ a, err := client.Agent(ctx, sid, agent.AgentOptions{
 | 方法 | 说明 |
 | --- | --- |
 | `a.Chat(ctx, prompt)` | 追加用户消息并运行 agent loop，阻塞直到结束 |
-| `a.ChatMessage(ctx, rawJSON)` | 同上，自己构造用户消息（多模态图片等） |
+| `a.ChatMessage(ctx, rawJSON)` | 同上，自己构造用户消息（多模态图片等）。只接受 `text` 和 `image_url` 片段，图片必须是 http(s) URL，不支持 base64（`data:`），否则返回 `ErrInvalidUserMessage`；`EnqueueMessage` 同样校验 |
 | `a.Continue(ctx)` | 不加新消息继续运行（Stop 后、报错后、输出被截断后） |
-| `a.Stop(ctx)` | 停止会话，**阻塞到会话变为 `idle`** 才返回；幂等，可并发、可跨进程调用（详见下文“Stop”） |
+| `a.Stop(ctx)` | 请求停止会话，**不等待**运行退出就返回；幂等，可并发、可跨进程调用（详见下文“Stop”） |
 | `a.Confirm(ctx, decisions...)` | 批准 / 拒绝待确认的 RPC 调用，全部处理完后继续 loop |
 | `a.Status(ctx)` | `idle` / `running` / `stopping` / `waiting_confirmation` |
 | `a.PendingCalls(ctx)` | 待确认的 RPC 调用列表 |
-| `a.Send(ctx, prompt)` | **推荐前端统一使用**：会话空闲就直接开始对话，运行中就交给当前这次运行，不用自己判断状态（见“消息队列”） |
-| `a.Enqueue(ctx, prompt)` | 只放进队列，下一次调用大模型前插入（见“消息队列”） |
+| `a.Enqueue(ctx, prompt)` | 运行中随时追加用户消息，下一次调用大模型前插入（见“消息队列”） |
+| `a.CancelQueued(ctx, queueID)` | 撤回还没发出的排队消息，已发出返回 `ErrQueuedMessageSent` |
 | `a.Session(ctx)` / `a.SessionID()` / `a.Client()` | 会话信息 / 会话 ID / 所属 Client |
 
 一次运行（`Chat` / `Continue` / `Confirm`）会在以下情况返回，`RunResult.StopReason` 说明原因：
@@ -210,7 +210,11 @@ a, err := client.Agent(ctx, sid, agent.AgentOptions{
 - `stopped`：调用了 `Stop`，见下文
 - `max_steps`：达到 `Config.MaxSteps`（默认 50 次 LLM 调用）
 
-`Chat` 会阻塞到本次运行结束，Web 服务里一般放到 goroutine 中执行，前端轮询数据库获取进度（见“流式输出与前端轮询”）。`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
+`Chat` 会阻塞到本次运行结束，Web 服务里一般放到 goroutine 中执行，前端轮询数据库获取进度（见“流式输出与前端轮询”）。
+
+**运行只能通过 `Stop` 停止**：传给 `Chat` / `ChatMessage` / `Continue` / `Confirm` 的 ctx 只在开始运行之前有效（ctx 已经取消就直接返回错误，不会开始运行）。运行开始后再取消 ctx 不会影响它（ctx 里的值仍然可以在 handler 中取到）。所以在 goroutine 里直接传 HTTP 请求的 ctx 是安全的：请求结束了，运行照常继续。要停止运行就调用 `Stop`。
+
+**输出被截断**：模型输出达到 `max_tokens` 时，本次运行正常结束（`StopReason = completed`），`RunResult.FinishReason` 为 `"length"`，调用 `Continue` 让模型接着写。如果截断发生在工具调用的参数中间，这个调用不会执行，模型会收到 `-32700` 错误结果并自行处理。`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
 
 **状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行期间后台每几秒心跳一次（流式输出和长时间的 RPC 调用中也会），超过 `Config.StaleAfter`（默认 1 分钟）没有心跳的会话可被其他运行接管。进程重启时由 `NewClient` 统一恢复，见“异常恢复”。
 
@@ -232,21 +236,21 @@ idle ──Chat/Continue──▶ running ──完成──▶ idle
 - **大模型输出中**：立刻取消请求，已生成的文本保留为不完整的助手消息（`interrupted`），会进入后续对话历史。
 - **工具调用执行中**：**不等待** handler，立刻把结果写成 `stopped by user while this call was running; it may or may not have taken effect`。handler 的 ctx 会被取消，它之后返回的结果会被丢弃，不会写入数据库（Go 无法强杀 goroutine，handler 应该尊重 ctx）。
 - **未执行的调用**（排队中、已批准未执行、**等待确认中**）：结果写成 `stopped by user: this call was not executed`。
-- 以上错误码都是 `-32002`，全部写完后会话变为 `idle`。**Stop 之后会话总是 `idle`**，不会停在 `waiting_confirmation`。
+- 以上错误码都是 `-32002`，全部写完后会话变为 `idle`。**停止完成后会话总是 `idle`**，不会停在 `waiting_confirmation`。
+
+`Stop` **不阻塞**：会话在运行中时，它只把状态改为 `stopping`（本进程的运行会被立即取消）就返回，收尾由运行自己完成。想知道是否停好了，按 session id 查 `client.Session(ctx, sid)`，`status` 变成 `idle` 即可。本进程内一般几毫秒，另一个进程里的运行约 `StopPollInterval` 内。会话在 `waiting_confirmation` 时没有运行，`Stop` 直接取消待确认调用，返回时已经是 `idle`。
 
 并发与竞争：
 
 | 情况 | 行为 |
 | --- | --- |
-| 重复 / 并发调用 `Stop` | 幂等。都会等到 `idle` 后返回 `nil` |
+| 重复 / 并发调用 `Stop` | 幂等，都返回 `nil`；`stopping` 期间再调用直接返回 |
 | 会话已是 `idle` | 立即返回 `nil` |
 | 会话是 `waiting_confirmation` | 取消所有待确认调用，变为 `idle` |
 | `Stop` 与运行自然结束同时发生 | 如果运行结束时发现状态已是 `stopping`，按停止处理；如果运行抢先变成 `waiting_confirmation`，`Stop` 会接着取消待确认调用。最终都是 `idle` |
-| `Stop` 返回后立刻 `Chat` | 可以，不会 `ErrBusy` |
-| `stopping` 期间调用 `Chat` | 返回 `ErrBusy` |
+| `Stop` 返回后立刻 `Chat` | 运行可能还没退出（`stopping`），会返回 `ErrBusy`，等会话变为 `idle` 后再调 |
 | 另一个进程调用 `Stop` | 运行方每隔 `StopPollInterval`（默认 1 秒）读一次会话状态，约 1 秒内停止 |
-| 持有会话的进程已经挂了 | 超过 `StaleAfter` 没有心跳时，`Stop` 自己接管并清理（等同崩溃恢复），不会一直等 |
-| 传给 `Stop` 的 ctx 超时 | 返回 ctx 的错误，但停止流程仍会继续完成 |
+| 持有会话的进程已经挂了 | 超过 `StaleAfter` 没有心跳时，`Stop` 自己接管并清理（等同崩溃恢复），返回时已是 `idle`。还没超过 `StaleAfter` 的，会话停在 `stopping`，等下一次运行或 `NewClient` 的崩溃恢复按超时接管 |
 
 `Chat` 被停止时返回 `RunResult{StopReason: "stopped", Status: "idle"}`，`err` 为 `nil`。
 
@@ -592,7 +596,7 @@ agent.Config{
 
 ### 上下文压缩
 
-设置了 `ContextLength` 后，每次调用大模型前都会估算这次请求的大小。估算方法是上一次调用的真实 token 数，加上之后新增消息的字节数除以 3。超过 `CompactionThreshold`（默认 80%）时会先压缩。压缩会插入一条 `Kind = "compaction"` 的消息，**之后发给模型的历史从这条压缩消息开始**。从 session id 恢复对话时也一样；没有压缩消息就从第一条开始。数据库里的消息不会被删除，前端照常可以看到完整历史。
+设置了 `ContextLength` 后，每次调用大模型前都会估算这次请求的大小。估算方法是上一次调用的真实 token 数，加上之后新增消息的字节数除以 3；图片不按 URL 长度算，每张固定按 500 token 计。超过 `CompactionThreshold`（默认 80%）时会先压缩。压缩会插入一条 `Kind = "compaction"` 的消息，**之后发给模型的历史从这条压缩消息开始**。从 session id 恢复对话时也一样；没有压缩消息就从第一条开始。数据库里的消息不会被删除，前端照常可以看到完整历史。
 
 | `Config.Compaction` | 行为 |
 | --- | --- |
@@ -618,32 +622,21 @@ agent.Config{
 
 ### 消息队列（运行中追加用户消息）
 
-**推荐用 `a.Send`**：前端发消息时不用关心会话当前在做什么：
-
-```go
-r, err := a.Send(ctx, "另外，其中一位是素食者")
-// r.Run != nil：会话原本空闲，Send 自己开始了一次运行，r.Run 是这次运行的结果（和 Chat 一样会阻塞到结束）
-// r.Queued：消息交给了正在进行的运行（由它来回答），或者排在待确认调用之后（确认后发出）
-```
-
-1. 消息先存进队列，进程崩溃也不会丢。
-2. 会话空闲时，Send 自己开始一次运行来处理这条消息。
-3. 会话正在运行时，等待当前运行在下一次调用大模型前取走这条消息，然后返回 `Queued`。**如果当前运行恰好在取走之前就结束了**（消息正好在运行结束的那一刻到达），Send 会自己再开始一次运行。所以通过 Send 发出的消息一定会得到回答。
-4. 会话在等待确认时，立即返回 `Queued`，消息会在 `Confirm` 之后发出。
-
-也可以直接使用底层的队列接口：
+agent 执行过程中（比如正在调用工具），用户可以随时补充内容：
 
 ```go
 id, _ := a.Enqueue(ctx, "另外，其中一位是素食者")        // 或 client.Enqueue(ctx, sid, ...)
 client.QueuedMessages(ctx, sid)                          // 还在队列里、没发出去的消息
-client.CancelQueued(ctx, sid, id)                        // 发出去之前可以撤回
+a.CancelQueued(ctx, id)                                  // 发出去之前可以撤回（或 client.CancelQueued(ctx, sid, id)）
 client.EnqueueMessage(ctx, sid, rawJSON)                 // 多模态消息
 ```
 
 - 队列存在数据库里（`agent_queued_messages`）。**下一次调用大模型之前**，队列中的所有消息按顺序各自作为一条 `role=user` 消息插入对话，同时从队列中删除，然后一次性发给模型。
 - 如果模型已经给出最终回答，队列里却还有消息，agent 会继续下一轮，回应这些补充内容，不会把它们漏掉。
 - 会话空闲时入队的消息，会在下一次 `Chat` / `Continue` 开始时插入，排在新问题之前。
+- `Enqueue` 不启动运行，也不等待。如果消息恰好在运行结束的那一刻入队（运行已经检查过队列），这次运行不会回答它，它会留在队列里，等下一次 `Chat` / `Continue`。需要确保被回答时，入队后查一下会话状态，已经是 `idle` 就调 `Continue`。
 - 插入时使用确定性的消息 ID（`msg_<队列ID>`），进程崩溃也不会重复插入。
+- **撤回**：`CancelQueued` 只能撤回还在排队的消息。运行在插入前会先“认领”队列里的消息，被认领或已经插入对话的消息撤回不了，返回 `ErrQueuedMessageSent`（模型会看到它），前端可以提示“已发送，无法撤回”。返回 `nil` 表示消息已不在队列中（这次撤回成功，或之前已撤回，或 id 不存在）。`QueuedMessages` 只列出还能撤回的消息。
 
 ### Reminder
 

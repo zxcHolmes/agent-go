@@ -153,6 +153,11 @@ func (a *Agent) PendingCalls(ctx context.Context) ([]RPCCall, error) {
 // Chat appends a user message and runs the agent loop until the model answers
 // without tool calls, a call needs confirmation, Stop is called, or MaxSteps
 // is reached. It blocks for the whole run; poll the store for progress.
+//
+// Cancelling ctx does not stop a run that has started (only Stop does), so
+// running Chat in a goroutine with an HTTP request's ctx is safe; ctx only
+// matters until the session is acquired. The same holds for ChatMessage,
+// Continue and Confirm.
 func (a *Agent) Chat(ctx context.Context, prompt string) (*RunResult, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return nil, errors.New("agent: empty prompt")
@@ -166,13 +171,28 @@ func (a *Agent) Chat(ctx context.Context, prompt string) (*RunResult, error) {
 
 // ChatMessage is Chat with a caller-built user message, e.g. multimodal
 // content: {"role":"user","content":[{"type":"text","text":"..."},{"type":"image_url",...}]}.
+// Only text and image_url parts are accepted, and images must be http(s)
+// URLs (no base64 data URLs); otherwise it returns ErrInvalidUserMessage.
 func (a *Agent) ChatMessage(ctx context.Context, raw json.RawMessage) (*RunResult, error) {
-	if !json.Valid(raw) {
-		return nil, errors.New("agent: user message is not valid JSON")
+	if err := checkUserMessage(raw); err != nil {
+		return nil, err
 	}
 	return a.run(ctx, []Status{StatusIdle}, func(ctx context.Context, st *runState) error {
-		// Close leftovers of an interrupted run and add queued messages first.
-		if err := a.prepareQueuedRun(ctx, st); err != nil {
+		open, err := openCalls(st.db, a.store, a.sessionID)
+		if err != nil {
+			return err
+		}
+		for _, c := range open {
+			if c.Status == CallAwaitingConfirmation {
+				return ErrWaitingConfirmation
+			}
+		}
+		// Leftovers from an interrupted run: close them so the history stays valid.
+		if err := a.cancelCalls(ctx, st, open, false, &RPCError{Code: CodeCancelled, Message: "cancelled: superseded by a new user message"}); err != nil {
+			return err
+		}
+		// Messages queued while the session was idle come before the new prompt.
+		if _, err := a.drainQueue(ctx, st); err != nil {
 			return err
 		}
 		m, err := a.userMessage(raw)
@@ -189,6 +209,12 @@ func (a *Agent) ChatMessage(ctx context.Context, raw json.RawMessage) (*RunResul
 // users add details while the agent is working. It returns the queue id.
 func (a *Agent) Enqueue(ctx context.Context, prompt string) (string, error) {
 	return a.client.Enqueue(ctx, a.sessionID, prompt)
+}
+
+// CancelQueued withdraws a queued message before it is sent; see
+// Client.CancelQueued.
+func (a *Agent) CancelQueued(ctx context.Context, queueID string) error {
+	return a.client.CancelQueued(ctx, a.sessionID, queueID)
 }
 
 // Continue resumes the loop without a new user message, e.g. after Stop, an

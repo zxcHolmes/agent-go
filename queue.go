@@ -27,24 +27,81 @@ func userRaw(prompt string) (json.RawMessage, error) {
 	}{"user", prompt})
 }
 
+// userContentPart is one part of a multimodal user message.
+type userContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	ImageURL *struct {
+		URL string `json:"url"`
+	} `json:"image_url"`
+}
+
+// checkUserMessage validates a caller-built user message: role "user" and
+// content that is a string or a list of "text" and "image_url" parts. Images
+// must be absolute http(s) URLs; inline data (base64 "data:" URLs) is refused.
+func checkUserMessage(raw json.RawMessage) error {
+	var m struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("%w: not a JSON object", ErrInvalidUserMessage)
+	}
+	if m.Role != "user" {
+		return fmt.Errorf("%w: role must be \"user\"", ErrInvalidUserMessage)
+	}
+	var s string
+	if json.Unmarshal(m.Content, &s) == nil {
+		return nil
+	}
+	var parts []userContentPart
+	if err := json.Unmarshal(m.Content, &parts); err != nil || len(parts) == 0 {
+		return fmt.Errorf("%w: content must be a string or a non-empty list of parts", ErrInvalidUserMessage)
+	}
+	for i, p := range parts {
+		switch p.Type {
+		case "text":
+		case "image_url":
+			if p.ImageURL == nil {
+				return fmt.Errorf("%w: part %d: image_url is required", ErrInvalidUserMessage, i)
+			}
+			if err := checkImageURL(p.ImageURL.URL); err != nil {
+				return fmt.Errorf("%w: part %d: %v", ErrInvalidUserMessage, i, err)
+			}
+		default:
+			return fmt.Errorf("%w: part %d: unsupported type %q (only text and image_url)", ErrInvalidUserMessage, i, p.Type)
+		}
+	}
+	return nil
+}
+
 func enqueue(ctx context.Context, store Store, sessionID string, raw json.RawMessage) (string, error) {
-	if !json.Valid(raw) {
-		return "", errors.New("agent: queued message is not valid JSON")
+	if err := checkUserMessage(raw); err != nil {
+		return "", err
 	}
 	if _, err := getSession(ctx, store, sessionID); err != nil {
 		return "", err
 	}
 	id := newID("q")
-	_, err := store.Exec(ctx, "INSERT INTO agent_queued_messages (id, session_id, content, raw, created_at) VALUES (?, ?, ?, ?, ?)",
-		id, sessionID, decodeMessage(raw).Content, string(raw), nowMillis())
+	_, err := store.Exec(ctx, "INSERT INTO agent_queued_messages (id, session_id, content, raw, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		id, sessionID, decodeMessage(raw).Content, string(raw), queueWaiting, nowMillis())
 	if err != nil {
 		return "", fmt.Errorf("agent: enqueue: %w", err)
 	}
 	return id, nil
 }
 
-func queuedMessages(ctx context.Context, store Store, sessionID string) ([]QueuedMessage, error) {
-	rows, err := store.Query(ctx, "SELECT id, session_id, content, raw, created_at FROM agent_queued_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC", sessionID)
+// Queue row states. A running agent claims waiting rows ("taken") before it
+// adds them to the conversation, so a cancel racing it either removes the row
+// first or finds it taken; never both.
+const (
+	queueWaiting = "queued"
+	queueTaken   = "taken"
+)
+
+// queuedMessages lists the rows in the given state, oldest first.
+func queuedMessages(ctx context.Context, store Store, sessionID, status string) ([]QueuedMessage, error) {
+	rows, err := store.Query(ctx, "SELECT id, session_id, content, raw, created_at FROM agent_queued_messages WHERE session_id = ? AND status = ? ORDER BY created_at ASC, id ASC", sessionID, status)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +120,35 @@ func queuedMessages(ctx context.Context, store Store, sessionID string) ([]Queue
 	return out, rows.Err()
 }
 
+// cancelQueued removes a waiting message. It reads back instead of trusting
+// RowsAffected: a row that is still there was taken by a run, and a message
+// with the derived id is already in the conversation.
 func cancelQueued(ctx context.Context, store Store, sessionID, id string) error {
+	if _, err := store.Exec(ctx, "DELETE FROM agent_queued_messages WHERE session_id = ? AND id = ? AND status = ?", sessionID, id, queueWaiting); err != nil {
+		return err
+	}
+	rows, err := store.Query(ctx, "SELECT id FROM agent_queued_messages WHERE session_id = ? AND id = ?", sessionID, id)
+	if err != nil {
+		return err
+	}
+	taken := rows.Next()
+	err = errors.Join(rows.Err(), rows.Close())
+	if err != nil {
+		return err
+	}
+	if taken {
+		return ErrQueuedMessageSent
+	}
+	if _, err := getMessage(ctx, store, sessionID, "msg_"+id); err == nil {
+		return ErrQueuedMessageSent
+	} else if !errors.Is(err, ErrMessageNotFound) {
+		return err
+	}
+	return nil
+}
+
+// deleteQueued drops a row once its message is in the conversation.
+func deleteQueued(ctx context.Context, store Store, sessionID, id string) error {
 	_, err := store.Exec(ctx, "DELETE FROM agent_queued_messages WHERE session_id = ? AND id = ?", sessionID, id)
 	return err
 }
@@ -113,11 +198,17 @@ func (a *Agent) userMessage(raw json.RawMessage) (Message, error) {
 	return m, nil
 }
 
-// drainQueue moves queued messages into the conversation. Each becomes a
-// message with a deterministic id before its queue row is deleted, so a crash
-// in between never duplicates it.
+// drainQueue moves queued messages into the conversation. It first claims
+// the waiting rows (so CancelQueued can no longer remove them), then turns
+// each claimed row into a message with a deterministic id before deleting
+// it, so a crash in between never loses or duplicates one: rows left taken
+// by a crashed run are picked up here by the next one.
 func (a *Agent) drainQueue(ctx context.Context, st *runState) (int, error) {
-	qs, err := queuedMessages(st.db, a.store, a.sessionID)
+	if _, err := a.store.Exec(st.db, "UPDATE agent_queued_messages SET status = ? WHERE session_id = ? AND status = ?",
+		queueTaken, a.sessionID, queueWaiting); err != nil {
+		return 0, err
+	}
+	qs, err := queuedMessages(st.db, a.store, a.sessionID, queueTaken)
 	if err != nil || len(qs) == 0 {
 		return 0, err
 	}
@@ -135,7 +226,7 @@ func (a *Agent) drainQueue(ctx context.Context, st *runState) (int, error) {
 		} else if err != nil {
 			return 0, err
 		}
-		if err := cancelQueued(st.db, a.store, a.sessionID, q.ID); err != nil {
+		if err := deleteQueued(st.db, a.store, a.sessionID, q.ID); err != nil {
 			return 0, err
 		}
 	}
@@ -144,118 +235,6 @@ func (a *Agent) drainQueue(ctx context.Context, st *runState) (int, error) {
 }
 
 func (a *Agent) hasQueued(st *runState) (bool, error) {
-	qs, err := queuedMessages(st.db, a.store, a.sessionID)
+	qs, err := queuedMessages(st.db, a.store, a.sessionID, queueWaiting)
 	return len(qs) > 0, err
-}
-
-// SendResult tells how Send delivered a message.
-type SendResult struct {
-	// QueueID is the id the message had in the queue.
-	QueueID string
-	// Run is the result of the run Send started itself because the session
-	// was idle; nil when the message went to another run.
-	Run *RunResult
-	// Queued is true when the message was handed to a run that was already
-	// active (it is answered by that run), or left in the queue behind calls
-	// awaiting confirmation (it is sent once they are confirmed).
-	Queued bool
-}
-
-// Send delivers a user message whatever the session is doing, so callers do
-// not have to check the status first:
-//
-//   - idle: it starts a run like Chat and blocks until the run ends;
-//   - running / stopping: the message joins the active run's next LLM call;
-//     Send returns as soon as that run has taken it. If the run ends first
-//     (the message arrived just as it finished), Send starts a new run itself,
-//     so the message is always answered;
-//   - waiting for confirmation: the message stays queued and is sent after
-//     Confirm; Send returns immediately.
-//
-// The message is stored in the queue before anything else, so it survives a
-// crash. If ctx ends while waiting, Send returns ctx's error and the message
-// stays queued for the next run.
-func (a *Agent) Send(ctx context.Context, prompt string) (*SendResult, error) {
-	id, err := a.Enqueue(ctx, prompt)
-	if err != nil {
-		return nil, err
-	}
-	out := &SendResult{QueueID: id}
-	for {
-		res, err := a.run(ctx, []Status{StatusIdle}, func(ctx context.Context, st *runState) error {
-			n, err := a.prepareQueued(ctx, st)
-			if err == nil && n == 0 {
-				return errNothingQueued // another run already answered it
-			}
-			return err
-		}, true)
-		switch {
-		case err == nil:
-			out.Run = res
-			return out, nil
-		case errors.Is(err, ErrWaitingConfirmation), errors.Is(err, errNothingQueued):
-			out.Queued = true
-			return out, nil
-		case !errors.Is(err, ErrBusy):
-			return out, err
-		}
-		// Another run is active: wait until it takes the message or ends.
-		for {
-			if still, err := a.isQueued(ctx, id); err != nil {
-				return out, err
-			} else if !still {
-				out.Queued = true
-				return out, nil
-			}
-			s, err := getSession(ctx, a.store, a.sessionID)
-			if err != nil {
-				return out, err
-			}
-			if s.Status != StatusRunning && s.Status != StatusStopping {
-				break // it ended without our message: start a run ourselves
-			}
-			t := time.NewTimer(100 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return out, context.Cause(ctx)
-			case <-t.C:
-			}
-		}
-	}
-}
-
-// prepareQueuedRun is Chat's preparation without a new prompt: close calls
-// left by an interrupted run, then add the queued messages.
-func (a *Agent) prepareQueuedRun(ctx context.Context, st *runState) error {
-	_, err := a.prepareQueued(ctx, st)
-	return err
-}
-
-// errNothingQueued ends a Send run that found its message already taken.
-var errNothingQueued = errors.New("agent: nothing queued")
-
-func (a *Agent) prepareQueued(ctx context.Context, st *runState) (int, error) {
-	open, err := openCalls(st.db, a.store, a.sessionID)
-	if err != nil {
-		return 0, err
-	}
-	for _, c := range open {
-		if c.Status == CallAwaitingConfirmation {
-			return 0, ErrWaitingConfirmation
-		}
-	}
-	if err := a.cancelCalls(ctx, st, open, false, &RPCError{Code: CodeCancelled, Message: "cancelled: superseded by a new user message"}); err != nil {
-		return 0, err
-	}
-	return a.drainQueue(ctx, st)
-}
-
-func (a *Agent) isQueued(ctx context.Context, id string) (bool, error) {
-	rows, err := a.store.Query(ctx, "SELECT id FROM agent_queued_messages WHERE session_id = ? AND id = ?", a.sessionID, id)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	return rows.Next(), rows.Err()
 }

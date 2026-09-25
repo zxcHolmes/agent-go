@@ -27,7 +27,8 @@ type reply struct {
 	httpErr   int           // respond with this HTTP status and body instead
 	streamErr string        // send this error object inside a 200 stream instead
 	body      string
-	prompt    int // prompt_tokens to report (default 1000)
+	prompt    int    // prompt_tokens to report (default 1000)
+	finish    string // finish_reason to report (default stop / tool_calls)
 }
 
 // fakeLLM is a scripted, streaming OpenAI-compatible server.
@@ -104,6 +105,9 @@ func (f *fakeLLM) handler(w http.ResponseWriter, r *http.Request) {
 	finish := "stop"
 	if len(m.ToolCalls) > 0 {
 		finish = "tool_calls"
+	}
+	if rp.finish != "" {
+		finish = rp.finish
 	}
 	send(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}})
 	prompt := rp.prompt

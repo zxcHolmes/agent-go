@@ -10,7 +10,7 @@ SQL-like `Store`, so sessions can be polled by a frontend, resumed by id and
 recovered after crashes.
 
 Main features: streaming with throttled DB flushes, confirmation-gated RPC methods,
-synchronous cross-process Stop, crash recovery, context compaction (anchor /
+non-blocking cross-process Stop, crash recovery, context compaction (anchor /
 summary), user message queue, reminder, RPC result limit, credit billing with safe
 settlement. User-facing docs are in `README.md` (Chinese).
 
@@ -30,6 +30,9 @@ settlement. User-facing docs are in `README.md` (Chinese).
   - MySQL indexes are declared inline (no `CREATE INDEX IF NOT EXISTS`);
   - don't trust RowsAffected (MySQL reports changed rows); read back instead
     (see `acquire`).
+- Caller-built user messages (`ChatMessage`, `EnqueueMessage`) go through
+  `checkUserMessage`: only `text` / `image_url` parts, images must be http(s)
+  URLs (no base64). The token estimate counts each image as 500 tokens.
 - JSON: use `marshalJSON` (no HTML escaping). A message's `raw` column is the exact
   bytes sent to the model and must not change once final — it is replayed
   byte-for-byte so provider prefix caches keep hitting. Build messages with
@@ -53,6 +56,9 @@ settlement. User-facing docs are in `README.md` (Chinese).
   `excluded` messages are kept for display but never sent.
 - Storage writes during a run use `st.db` (`context.WithoutCancel`) so Stop never
   leaves half-written state; LLM calls and handlers use the cancellable run ctx.
+- A run is detached from the caller's ctx once the session is acquired
+  (`run` wraps it in `context.WithoutCancel`): only Stop (or losing the lock)
+  ends it.
 - One run per session via the `agent_sessions.run_id` lock + heartbeat; a run that
   lost the lock (`ErrLockLost`) must not write anything.
 - Crash safety relies on deterministic ids for derived rows (`msg_img_<call>`,
@@ -78,12 +84,13 @@ settlement. User-facing docs are in `README.md` (Chinese).
   Continue, Confirm, Enqueue).
 - `run.go` — run lifecycle: acquire, heartbeat, heal, finish.
 - `lock.go` — session lock (acquire/checkpoint/release).
-- `stop.go` — synchronous, idempotent Stop incl. taking over dead runs.
+- `stop.go` — non-blocking, idempotent Stop (marks `stopping`, cancels a
+  local run) incl. taking over dead runs.
 - `loop.go` — agent loop, call execution, tool message bookkeeping.
 - `step.go` — one streamed LLM call, throttled flushes, usage recording.
 - `compaction.go` — context window, token estimate, anchor/summary compaction.
-- `queue.go` — queued user messages, reminder injection, `Send` (enqueue, then
-  run if idle / wait for the active run to take it / run if it ended first).
+- `queue.go` — queued user messages (claimed `taken` before insertion so
+  `CancelQueued` never races a run), reminder injection.
 - `rpc.go` / `prompt.go` / `jsonschema.go` — Method/Call/Typed/NewMethod, JSON-RPC
   dispatch and result limit, system prompt + tool definition, struct-tag schemas.
 - `viewimage.go` — `view_image` tool and healing of unloadable image URLs.

@@ -53,13 +53,11 @@ func TestStopAndContinue(t *testing.T) {
 	if err := e.newAgent(t, a.SessionID()).Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(start) > time.Second {
+	if time.Since(start) > 100*time.Millisecond {
 		t.Fatalf("Stop took %v", time.Since(start))
 	}
-	// Stop is synchronous: the session is idle as soon as it returns.
-	if st, _ := a.Status(ctx); st != agent.StatusIdle {
-		t.Fatal(st)
-	}
+	// Stop does not wait: the run finishes stopping on its own.
+	waitFor(t, "idle", func() bool { st, _ := a.Status(ctx); return st == agent.StatusIdle })
 	res := <-done
 	if res.StopReason != agent.StopStopped || res.Status != agent.StatusIdle {
 		t.Fatalf("%+v", res)
@@ -209,6 +207,43 @@ func TestStopFromAnotherProcess(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("remote stop not noticed")
+	}
+}
+
+// Stop of a run owned by another process only marks the session; it does not
+// wait for that process to notice.
+func TestStopDoesNotWaitForRemoteRun(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	if _, err := e.store.Exec(ctx, "UPDATE agent_sessions SET status = 'running', run_id = 'run_remote', updated_at = ? WHERE id = ?",
+		time.Now().UnixMilli(), a.SessionID()); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := a.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatalf("Stop took %v", time.Since(start))
+	}
+	if st, _ := a.Status(ctx); st != agent.StatusStopping {
+		t.Fatal(st)
+	}
+	if err := a.Stop(ctx); err != nil { // repeated while stopping
+		t.Fatal(err)
+	}
+	if _, err := a.Chat(ctx, "hi"); !errors.Is(err, agent.ErrBusy) {
+		t.Fatalf("want ErrBusy, got %v", err)
+	}
+	// The remote process died before finishing the stop: the next run takes over once it is stale.
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	if _, err := e.store.Exec(ctx, "UPDATE agent_sessions SET updated_at = ? WHERE id = ?", old, a.SessionID()); err != nil {
+		t.Fatal(err)
+	}
+	e.llm.push(text("back"))
+	if res, err := a.Chat(ctx, "hi"); err != nil || res.Reply() != "back" {
+		t.Fatal(res, err)
 	}
 }
 
