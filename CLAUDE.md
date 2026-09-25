@@ -57,6 +57,11 @@ settlement. User-facing docs are in `README.md` (Chinese).
   lost the lock (`ErrLockLost`) must not write anything.
 - Crash safety relies on deterministic ids for derived rows (`msg_img_<call>`,
   `msg_<queueID>`) and on `heal()` at the start of every run.
+- Calls of one turn run in parallel (`executeAll`, `Config.ToolConcurrency`); they
+  only update pre-created rows, never insert messages, so ordering stays intact.
+  On stop/timeout a handler's error result is replaced by the stop/timeout
+  result (a ctx-aware handler errors *because* of the cancellation).
+- `DeleteSession` keeps `agent_llm_calls` on purpose (billing, no content).
 - A step reads only messages from the latest compaction point
   (`latestCompaction` + `messagesFromSeq`); never load a whole session.
 - Every LLM request (chat and summary) goes through `beforeLLMCall` first.

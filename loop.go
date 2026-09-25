@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,16 +22,17 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 		}
 		if len(open) > 0 {
 			waiting := false
+			var runnable []*RPCCall
 			for i := range open {
-				c := &open[i]
-				switch c.Status {
+				switch open[i].Status {
 				case CallQueued, CallApproved:
-					if err := a.execute(ctx, st, c); err != nil {
-						return "", err
-					}
+					runnable = append(runnable, &open[i])
 				case CallAwaitingConfirmation:
 					waiting = true
 				}
+			}
+			if err := a.executeAll(ctx, st, runnable); err != nil {
+				return "", err
 			}
 			if waiting {
 				return StopWaitingConfirmation, nil
@@ -61,6 +63,44 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 			return StopCompleted, nil
 		}
 	}
+}
+
+// executeAll runs the calls of one turn, in parallel up to
+// Config.ToolConcurrency (0 = all at once, 1 = one after another). Results
+// land in tool messages created up front in the model's order, so the order
+// seen by the model does not depend on which call finishes first. It returns
+// the first error after every started call has finished.
+func (a *Agent) executeAll(ctx context.Context, st *runState, calls []*RPCCall) error {
+	limit := a.cfg.ToolConcurrency
+	if limit <= 0 || limit > len(calls) {
+		limit = len(calls)
+	}
+	if limit <= 1 {
+		for _, c := range calls {
+			if err := a.execute(ctx, st, c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	sem := make(chan struct{}, limit)
+	errs := make([]error, len(calls))
+	var wg sync.WaitGroup
+	for i, c := range calls {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(i int, c *RPCCall) {
+			defer func() { <-sem; wg.Done() }()
+			errs[i] = a.execute(ctx, st, c)
+		}(i, c)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // execute runs one call. The tool message is marked "running" before the
@@ -94,19 +134,24 @@ func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 	case result = <-done:
 	case <-callCtx.Done():
 		select {
-		case result = <-done: // finished at the same instant: keep the real result
+		case result = <-done: // finished at the same instant
 		default:
-			switch {
-			case ctx.Err() == nil: // our timeout, not a stop
-				result = rpcErrorResponse(c.RPCID, &RPCError{Code: CodeTimeout,
-					Message: fmt.Sprintf("timed out after %s; the call may or may not have taken effect", timeout)})
-				a.log.Info("rpc call timed out", "session", a.sessionID, "method", c.Method, "timeout", timeout)
-			case errors.Is(context.Cause(ctx), ErrStopped):
-				status, result = CallCancelled, rpcErrorResponse(c.RPCID, errStoppedRunning)
-			default:
-				status, result = CallCancelled, rpcErrorResponse(c.RPCID, &RPCError{Code: CodeCancelled,
-					Message: "cancelled while this call was running (" + context.Cause(ctx).Error() + "); it may or may not have taken effect"})
-			}
+		}
+	}
+	// A handler that honours ctx returns an error as soon as it is cancelled;
+	// that error is a consequence of the stop or timeout, so report the stop
+	// or timeout instead. A successful result is kept: the work did happen.
+	if callCtx.Err() != nil && (result == nil || isErrorResponse(result)) {
+		switch {
+		case ctx.Err() == nil: // our timeout, not a stop
+			result = rpcErrorResponse(c.RPCID, &RPCError{Code: CodeTimeout,
+				Message: fmt.Sprintf("timed out after %s; the call may or may not have taken effect", timeout)})
+			a.log.Info("rpc call timed out", "session", a.sessionID, "method", c.Method, "timeout", timeout)
+		case errors.Is(context.Cause(ctx), ErrStopped):
+			status, result = CallCancelled, rpcErrorResponse(c.RPCID, errStoppedRunning)
+		default:
+			status, result = CallCancelled, rpcErrorResponse(c.RPCID, &RPCError{Code: CodeCancelled,
+				Message: "cancelled while this call was running (" + context.Cause(ctx).Error() + "); it may or may not have taken effect"})
 		}
 	}
 	a.log.Debug("rpc call", "session", a.sessionID, "method", c.Method, "duration_ms", time.Since(start).Milliseconds(),
@@ -259,4 +304,12 @@ func (a *Agent) notify(ctx context.Context, st *runState, messageID string) {
 	if m, err := getMessage(st.db, a.store, a.sessionID, messageID); err == nil {
 		a.cfg.OnMessage(ctx, *m)
 	}
+}
+
+// isErrorResponse reports whether a JSON-RPC response carries an error.
+func isErrorResponse(resp json.RawMessage) bool {
+	var r struct {
+		Error json.RawMessage `json:"error"`
+	}
+	return json.Unmarshal(resp, &r) == nil && len(r.Error) > 0 && string(r.Error) != "null"
 }

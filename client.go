@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 )
@@ -101,6 +102,36 @@ func (c *Client) Stop(ctx context.Context, sessionID string) error {
 		return err
 	}
 	return a.Stop(ctx)
+}
+
+// DeleteSession permanently deletes a session with its messages, RPC calls
+// and queued messages. Usage and billing records (token counts and credits
+// only, no conversation content) are kept so that unbilled usage can still
+// be settled. A running or stopping session cannot be deleted (ErrBusy):
+// Stop it first.
+func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
+	if _, err := getSession(ctx, c.store, sessionID); err != nil {
+		return err
+	}
+	// Deleting the session row first acts as the lock: a run can no longer
+	// acquire it, and the status condition keeps a live run untouched.
+	if _, err := c.store.Exec(ctx, "DELETE FROM agent_sessions WHERE id = ? AND status NOT IN (?, ?)",
+		sessionID, string(StatusRunning), string(StatusStopping)); err != nil {
+		return err
+	}
+	switch _, err := getSession(ctx, c.store, sessionID); {
+	case err == nil:
+		return ErrBusy
+	case !errors.Is(err, ErrSessionNotFound):
+		return err
+	}
+	for _, table := range []string{"agent_messages", "agent_rpc_calls", "agent_queued_messages"} {
+		if _, err := c.store.Exec(ctx, "DELETE FROM "+table+" WHERE session_id = ?", sessionID); err != nil {
+			return fmt.Errorf("agent: delete session %s: %w", sessionID, err)
+		}
+	}
+	c.log.Info("session deleted", "session", sessionID)
+	return nil
 }
 
 // PendingCalls returns the RPC calls of a session waiting for confirmation.

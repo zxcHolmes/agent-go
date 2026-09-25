@@ -166,8 +166,11 @@ client.Stop(ctx, sid)                                  // 不创建 agent 也能
 client.PendingCalls(ctx, sid)                          // 待确认的 RPC 调用
 client.Enqueue(ctx, sid, "补充一点……")                 // 运行中追加用户消息（见“消息队列”）
 client.ResetSession(ctx, sid)                          // 手动恢复单个会话（见“异常恢复”）
+client.DeleteSession(ctx, sid)                         // 删除会话（见下文）
 client.Recover(ctx)                                    // 重新执行一次启动时的崩溃恢复
 ```
+
+**删除会话**：`client.DeleteSession` 会永久删除会话本身、所有消息、RPC 调用记录和队列消息。token 用量和计费记录（`agent_llm_calls`）会**保留**：它们只包含 token 数和积分，不含对话内容，保留下来是为了让未结算的用量仍然可以结算。运行中或停止中的会话会返回 `ErrBusy`，需要先 `Stop`；会话不存在时返回 `ErrSessionNotFound`。SDK 不提供按用户查询会话的功能，session id 由调用方自己保存。
 
 `Config` 里的大模型配置（`BaseURL`、`Model` 等）只在创建 agent 时需要。只用来查消息、做结算的服务，传一个 `Store` 就够了。
 
@@ -410,6 +413,12 @@ user       [{"type":"text","text":"[view_image result for call_x] https://cdn.ex
 - 只接受 `http` / `https` 的 URL。其他地址（`file://`、`data:` 等）会以 `{"ok":false,"error":...}` 返回给模型，不会生成图片消息。
 - 进程崩溃时如果图片消息还没写入，下次运行开始时会自动补上，不会重复。
 - **图片加载失败不会卡死会话**：服务商拉取不到图片时（URL 404、防盗链等），会以 400 拒绝整个请求。如果不处理，这条图片消息每次都会被重放，会话就永久失败了。SDK 检测到这种情况时，会把本轮还没成功发送的图片消息标记为 `excluded`（前端仍可展示，但不再发给模型），把对应的工具结果改写为 `{"ok":false,"error":"...could not load this image..."}`，然后自动重试。模型会知道图片打不开，对话照常继续。
+
+#### 并行执行
+
+模型在一轮里发出多个调用时，默认**并行执行**。`Config.ToolConcurrency` 用来限制同时执行的数量：`0`（默认）表示全部同时执行，`1` 表示逐个执行，`n` 表示最多同时执行 n 个。每个调用的 tool 消息在执行前就已经按模型给出的顺序建好，结果写回原位，所以模型看到的顺序与完成先后无关。并行执行时，handler 和 `OnMessage` 回调需要是并发安全的。Stop 和超时对每个调用分别生效。
+
+实测：模型一轮发出 4 个查询，每个耗时 2 秒，并行执行后工具阶段总共 2.0 秒。
 
 #### 超时
 
@@ -707,6 +716,7 @@ agent.Config{
 | `StaleAfter` | 运行锁心跳超时，默认 1 分钟 |
 | `StopPollInterval` | 检查其他进程发来的 Stop 的间隔，默认 1 秒，负数关闭 |
 | `RPCTimeout` | RPC 调用的默认超时时间，默认不超时 |
+| `ToolConcurrency` | 同一轮 RPC 调用的并发数，0 = 全部并行（默认），1 = 逐个执行 |
 | `BeforeLLMCall` | 每次调用大模型前的钩子，可用于预算控制 |
 | `CacheControl` | 为 Claude 模型添加 `cache_control` 缓存断点 |
 | `Logger` / `LogLevel` | 日志输出和级别，见“日志” |

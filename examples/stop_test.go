@@ -25,6 +25,7 @@ func TestStopAndContinue(t *testing.T) {
 			return "late result", nil
 		},
 	})
+	e.cfg.ToolConcurrency = 1 // this test covers the call that has not started yet
 	ctx := context.Background()
 	a := e.newAgent(t, "")
 	e.llm.push(`{"role":"assistant","content":null,"tool_calls":[

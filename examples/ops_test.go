@@ -209,3 +209,24 @@ func (e *env) checkValid(t *testing.T, sid string) {
 		}
 	}
 }
+
+// A handler that honours ctx returns ctx.Err() on timeout; the model must
+// still see the timeout, not an internal "context deadline exceeded" error.
+func TestRPCTimeoutWithCtxAwareHandler(t *testing.T) {
+	e := setup(t, agent.Method{Name: "polite", Timeout: 50 * time.Millisecond, Handler: func(ctx context.Context, c *agent.Call) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}})
+	a := e.newAgent(t, "")
+	e.llm.push(toolCall("t1", "polite", `{}`), text("ok"))
+	for i := 0; i < 20; i++ { // the race is timing dependent
+		if _, err := a.Chat(context.Background(), "go"); err != nil {
+			t.Fatal(err)
+		}
+		ms, _ := e.client.LatestMessages(context.Background(), a.SessionID(), 2)
+		if !strings.Contains(ms[0].Content, `"code":-32004`) {
+			t.Fatalf("iteration %d: %s", i, ms[0].Content)
+		}
+		e.llm.push(toolCall("t1", "polite", `{}`), text("ok"))
+	}
+}

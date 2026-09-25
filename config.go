@@ -102,6 +102,12 @@ type Config struct {
 	// the text without it.
 	Reminder string
 
+	// ToolConcurrency limits how many RPC calls from one model turn run at
+	// the same time: 0 (default) runs them all in parallel, 1 runs them one
+	// after another. With parallel calls, handlers and the OnMessage callback
+	// must be safe for concurrent use.
+	ToolConcurrency int
+
 	// RPCTimeout bounds how long one RPC call may run; Method.Timeout
 	// overrides it per method. When it expires the handler's ctx is cancelled
 	// and the model gets a CodeTimeout error right away (a handler that
