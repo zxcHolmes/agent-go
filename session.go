@@ -79,7 +79,7 @@ func getSession(ctx context.Context, store Store, id string) (*Session, error) {
 
 // ---- messages ----
 
-const messageCols = "id, session_id, seq, role, status, content, reasoning, tool_call_id, raw, created_at, updated_at"
+const messageCols = "id, session_id, seq, role, kind, status, content, reasoning, tool_call_id, raw, created_at, updated_at"
 
 func scanMessages(rows Rows) ([]Message, error) {
 	defer rows.Close()
@@ -88,7 +88,7 @@ func scanMessages(rows Rows) ([]Message, error) {
 		var m Message
 		var raw, status string
 		var created, updated int64
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.Seq, &m.Role, &status, &m.Content, &m.Reasoning, &m.ToolCallID, &raw, &created, &updated); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Seq, &m.Role, &m.Kind, &status, &m.Content, &m.Reasoning, &m.ToolCallID, &raw, &created, &updated); err != nil {
 			return nil, err
 		}
 		m.Status = MessageStatus(status)
@@ -169,8 +169,8 @@ func insertMessage(ctx context.Context, store Store, m *Message) error {
 	}
 	m.Seq = seq + 1
 	_, err = store.Exec(ctx,
-		"INSERT INTO agent_messages ("+messageCols+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		m.ID, m.SessionID, m.Seq, m.Role, string(m.Status), m.Content, m.Reasoning, m.ToolCallID, string(m.Raw),
+		"INSERT INTO agent_messages ("+messageCols+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		m.ID, m.SessionID, m.Seq, m.Role, m.Kind, string(m.Status), m.Content, m.Reasoning, m.ToolCallID, string(m.Raw),
 		m.CreatedAt.UnixMilli(), m.UpdatedAt.UnixMilli())
 	if err != nil {
 		return fmt.Errorf("agent: insert message: %w", err)

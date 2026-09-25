@@ -63,6 +63,12 @@ const (
 	MessageInterrupted MessageStatus = "interrupted"
 )
 
+// MessageKindViewImage marks the user message the SDK injects to show the
+// model an image requested with the view_image tool. Its ToolCallID is the
+// id of that tool call, so a UI can render it as an attachment rather than
+// as something the user typed.
+const MessageKindViewImage = "view_image"
+
 // Final reports whether the message will not change anymore.
 func (s MessageStatus) Final() bool { return s == MessageDone || s == MessageInterrupted }
 
@@ -106,6 +112,7 @@ type Message struct {
 	SessionID  string          `json:"session_id"`
 	Seq        int64           `json:"seq"`
 	Role       string          `json:"role"`
+	Kind       string          `json:"kind,omitempty"` // "" for regular messages; MessageKindViewImage for injected images
 	Status     MessageStatus   `json:"status"`
 	Content    string          `json:"content"`
 	Reasoning  string          `json:"reasoning,omitempty"` // streamed reasoning / thinking text

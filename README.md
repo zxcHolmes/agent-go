@@ -2,7 +2,7 @@
 
 一个轻量、零第三方依赖的 Go Agent SDK，对接任意 **OpenAI 兼容**的 Chat Completions 接口。
 
-- 模型只有**一个工具**：JSON-RPC 2.0 调用（`method` / `params` / `id`）。你注册的 Go 方法都通过它被调用，SDK 负责路由、参数错误回传、panic 兜底。
+- 模型的核心工具是 **JSON-RPC 2.0 调用**（`method` / `params` / `id`）。你注册的 Go 方法都通过它被调用，SDK 负责路由、参数错误回传、panic 兜底。另有可选的内置工具 `view_image`，让模型通过 URL 查看图片。
 - 会话、消息、RPC 调用、每次 LLM 调用的全部 token 字段和积分都持久化到**抽象的 SQL 存储层**，通过 session id 随时恢复对话。
 - 消息按原始 JSON 字节完整保存并原样回放，保证大模型**前缀缓存**不丢失。
 - **流式输出**：助手消息边生成边写库（默认每 2 秒刷新一次，可配置），前端轮询数据库即可拿到实时内容。
@@ -244,7 +244,7 @@ idle ──Chat/Continue──▶ running ──完成──▶ idle
 
 ### RPC 方法
 
-模型拿到的唯一工具默认叫 `json_rpc`（`Config.ToolName` 可改），参数是一个 JSON-RPC 请求：
+模型调用你的方法用的工具默认叫 `json_rpc`（`Config.ToolName` 可改），参数是一个 JSON-RPC 请求：
 
 ```json
 {"jsonrpc": "2.0", "method": "get_order", "params": {"order_id": "ORD-1"}, "id": 1}
@@ -341,6 +341,32 @@ Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 
 所有这些错误都只回给模型，不会中断 agent loop，模型可以自行修正后重试。
 
+### 查看图片（view_image）
+
+开启 `Config.ViewImage` 后，除了 `json_rpc`，模型还会多一个内置工具 `view_image`，参数只有一个 `url`。适合让模型查看用户发来的图片链接，或者某个 RPC 方法返回的图片地址。
+
+```go
+client, _ := agent.NewClient(ctx, agent.Config{
+	// ...
+	ViewImage:       true,  // 仅对支持视觉的模型开启，纯文本模型收到 image_url 会报错
+	ViewImageDetail: "low", // 可选：low / high / auto，low 消耗的图片 token 少很多
+})
+```
+
+SDK **不下载图片，也不转 Base64**，只把 URL 原样交给模型，由大模型服务商自己去拉取（所以 URL 必须是公网可访问的）。OpenAI 兼容接口的 tool 消息只能放文本，所以图片会作为紧跟在后面的一条独立 user 消息发给模型：
+
+```
+assistant  tool_calls: [view_image {"url": "https://cdn.example.com/cat.png"}]
+tool       {"ok":true,"url":"https://cdn.example.com/cat.png","note":"The image is attached in the next user message."}
+user       [{"type":"text","text":"[view_image result for call_x] https://cdn.example.com/cat.png"},
+            {"type":"image_url","image_url":{"url":"https://cdn.example.com/cat.png","detail":"low"}}]
+```
+
+- 同一轮有多个工具调用时，图片消息放在**这一轮所有 tool 消息之后**，保证工具调用和结果的配对不被打断。
+- 这条 user 消息的 `Message.Kind` 为 `"view_image"`，`ToolCallID` 指向对应的工具调用。前端可以据此把它渲染成附件，而不是用户说的话。
+- 只接受 `http` / `https` 的 URL。其他地址（`file://`、`data:` 等）会以 `{"ok":false,"error":...}` 返回给模型，不会生成图片消息。
+- 进程崩溃时如果图片消息还没写入，下次运行开始时会自动补上，不会重复。
+
 ### 上下文参数（身份验证）
 
 `AgentOptions.ContextParams` 用于传递当前请求的身份信息，handler 通过 `call.Value("user_id")` 或 `call.ContextParams` 读取。它**不会**发给模型，也**不会**持久化，每次 `client.Agent` 时由调用方传入当前用户的值即可——确认流程中由另一个请求来 `Confirm` 时，handler 拿到的是那次请求传入的上下文参数。
@@ -354,7 +380,7 @@ client.MessagesAfter(ctx, sid, msgID, 20)     // msgID 之后的 20 条
 client.Message(ctx, sid, msgID)               // 单条
 ```
 
-`Message` 字段：`ID`、`Seq`（会话内递增序号）、`Role`、`Status`、`Content`（提取出的文本）、`Reasoning`（思考过程文本）、`ToolCalls`、`ToolCallID`、`Raw`（完整原始 JSON）、`CreatedAt`、`UpdatedAt`。
+`Message` 字段：`ID`、`Seq`（会话内递增序号）、`Role`、`Kind`（普通消息为空；`view_image` 注入的图片消息为 `"view_image"`）、`Status`、`Content`（提取出的文本）、`Reasoning`（思考过程文本）、`ToolCalls`、`ToolCallID`、`Raw`（完整原始 JSON）、`CreatedAt`、`UpdatedAt`。
 
 ### 流式输出与前端轮询
 
@@ -518,6 +544,7 @@ type Store interface {
 
 | 字段 | 说明 |
 | --- | --- |
+| `ViewImage` / `ViewImageDetail` | 开启内置的 `view_image` 工具 / 设置 `image_url.detail`，见“查看图片” |
 | `SkipSchema` | `NewClient` 不建表（自己用 `SchemaStatements` 做迁移） |
 | `RecoverStaleAfter` | `NewClient` 只恢复超过这个时长没有心跳的会话，多实例部署时使用；0 表示恢复全部 |
 | `StreamFlushInterval` | 流式输出时写库的间隔，默认 2 秒 |

@@ -1,8 +1,9 @@
 // Package agent is a small agent SDK for OpenAI-compatible chat completion APIs.
 //
-// The model is given exactly one tool: a JSON-RPC 2.0 call. Every method the
-// host application registers becomes callable through that tool, and the SDK
-// dispatches each call to the matching Go handler. Output is streamed and
+// The model's main tool is a JSON-RPC 2.0 call. Every method the host
+// application registers becomes callable through that tool, and the SDK
+// dispatches each call to the matching Go handler. An optional built-in
+// view_image tool lets the model look at images by URL. Output is streamed and
 // saved to a SQL-like Store as it is generated, together with token usage,
 // credits and RPC calls, so a session can be polled, resumed or recovered
 // after a crash from its session id.

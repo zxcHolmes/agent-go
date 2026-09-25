@@ -33,6 +33,7 @@ func tableDefs(text string) []tableDef {
 				"session_id VARCHAR(64) NOT NULL",
 				"seq BIGINT NOT NULL",
 				"role VARCHAR(32) NOT NULL",
+				"kind VARCHAR(32) NOT NULL",
 				"status VARCHAR(32) NOT NULL",
 				"content " + text + " NOT NULL",
 				"reasoning " + text + " NOT NULL",

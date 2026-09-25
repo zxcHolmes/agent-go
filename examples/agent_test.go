@@ -618,8 +618,8 @@ func TestStopDeadRun(t *testing.T) {
 	if _, err := e.store.Exec(ctx, "UPDATE agent_sessions SET status = 'running', run_id = 'run_dead', updated_at = ? WHERE id = ?", old, a.SessionID()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.store.Exec(ctx, `INSERT INTO agent_messages (id, session_id, seq, role, status, content, reasoning, tool_call_id, raw, created_at, updated_at)
-		VALUES ('msg_dead', ?, 1, 'assistant', 'streaming', 'half', '', '', '{"role":"assistant","content":"half"}', ?, ?)`, a.SessionID(), old, old); err != nil {
+	if _, err := e.store.Exec(ctx, `INSERT INTO agent_messages (id, session_id, seq, role, kind, status, content, reasoning, tool_call_id, raw, created_at, updated_at)
+		VALUES ('msg_dead', ?, 1, 'assistant', '', 'streaming', 'half', '', '', '{"role":"assistant","content":"half"}', ?, ?)`, a.SessionID(), old, old); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Stop(ctx); err != nil {
@@ -940,6 +940,51 @@ func TestClientOverridesAndReadOnly(t *testing.T) {
 	}
 	if _, err := ro.Agent(ctx, "", agent.AgentOptions{}); err == nil {
 		t.Fatal("agent without BaseURL/Model must fail")
+	}
+}
+
+func TestViewImage(t *testing.T) {
+	e := setup(t)
+	e.cfg.ViewImage = true
+	e.cfg.ViewImageDetail = "low"
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	args, _ := json.Marshal(`{"url":"https://cdn.example.com/cat.png"}`)
+	bad, _ := json.Marshal(`{"url":"ftp://x/y.png"}`)
+	rpcArgs, _ := json.Marshal(`{"jsonrpc":"2.0","method":"get_order","params":{"order_id":"O"},"id":1}`)
+	// One turn mixing a JSON-RPC call, a valid and an invalid view_image call.
+	e.llm.push(fmt.Sprintf(`{"role":"assistant","content":null,"tool_calls":[
+		{"id":"t1","type":"function","function":{"name":"view_image","arguments":%s}},
+		{"id":"t2","type":"function","function":{"name":"json_rpc","arguments":%s}},
+		{"id":"t3","type":"function","function":{"name":"view_image","arguments":%s}}]}`, args, rpcArgs, bad),
+		text("A cat."))
+	res, err := a.Chat(ctx, "what is in this picture?")
+	if err != nil || res.Reply() != "A cat." {
+		t.Fatal(res, err)
+	}
+	if got := roles(res.Messages); got != "user,assistant,tool,tool,tool,user,assistant" {
+		t.Fatal(got)
+	}
+	img := res.Messages[5]
+	if img.Kind != agent.MessageKindViewImage || img.ToolCallID != "t1" || img.Status != agent.MessageDone {
+		t.Fatalf("%+v", img)
+	}
+	if !strings.Contains(res.Messages[4].Content, `"ok":false`) {
+		t.Fatalf("invalid url accepted: %s", res.Messages[4].Content)
+	}
+
+	// The tool is offered, and the model's next request carries the image part, unmodified.
+	if !bytes.Contains(e.llm.requests[0]["tools"], []byte(`"name":"view_image"`)) {
+		t.Fatal("view_image tool not offered")
+	}
+	msgs := e.llm.request(1)
+	last := string(msgs[len(msgs)-1])
+	if !strings.Contains(last, `{"type":"image_url","image_url":{"url":"https://cdn.example.com/cat.png","detail":"low"}}`) ||
+		!strings.Contains(last, `{"role":"user","content":[{"type":"text"`) {
+		t.Fatalf("image message: %s", last)
+	}
+	if !strings.Contains(string(msgs[len(msgs)-2]), `"tool_call_id":"t3"`) {
+		t.Fatal("image must come after every tool result")
 	}
 }
 

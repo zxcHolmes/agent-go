@@ -73,8 +73,15 @@ type Config struct {
 	// reasoning is always stored in Message.Reasoning either way.
 	KeepReasoning bool
 
-	// ToolName is the name of the single JSON-RPC tool (default "json_rpc").
+	// ToolName is the name of the JSON-RPC tool (default "json_rpc").
 	ToolName string
+	// ViewImage enables the built-in view_image tool (see ViewImageTool): the
+	// model passes an image URL and gets to see the image. Only enable it for
+	// vision-capable models; others reject image_url content.
+	ViewImage bool
+	// ViewImageDetail is sent as image_url.detail ("low", "high" or "auto");
+	// empty omits it. "low" is much cheaper in image tokens.
+	ViewImageDetail string
 	// MaxSteps bounds LLM calls per run (default 50).
 	MaxSteps int
 	// ExtraBody is merged into every request body (temperature, top_p,
@@ -207,12 +214,22 @@ func newAgent(ctx context.Context, c *Client, sessionID string, opts AgentOption
 			Content string `json:"content"`
 		}{"system", prompt})
 	}
+	if cfg.ViewImage && cfg.ToolName == ViewImageTool {
+		return nil, fmt.Errorf("agent: ToolName %q clashes with the built-in view_image tool", ViewImageTool)
+	}
 	if len(a.methods) > 0 {
 		tool, err := a.buildTool()
 		if err != nil {
 			return nil, err
 		}
-		a.tools = []json.RawMessage{tool}
+		a.tools = append(a.tools, tool)
+	}
+	if cfg.ViewImage {
+		tool, err := a.buildViewImageTool()
+		if err != nil {
+			return nil, err
+		}
+		a.tools = append(a.tools, tool)
 	}
 
 	if sessionID == "" {
@@ -563,7 +580,11 @@ func (a *Agent) reconcileCalls(ctx context.Context, st *runState) error {
 			return err
 		}
 	}
-	return nil
+	// Tool messages are complete now; add any view_image message still missing.
+	if calls, err = callsForMessage(st.db, a.store, msg.ID); err != nil {
+		return err
+	}
+	return a.attachImages(ctx, st, calls)
 }
 
 func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, err error) (*RunResult, error) {
@@ -816,9 +837,13 @@ func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
 		Method: tc.Function.Name, Status: CallQueued, ResultMessageID: newID("msg"), CreatedAt: now, UpdatedAt: now,
 	}
 	fallbackID, _ := marshalJSON(tc.ID)
-	if tc.Function.Name != a.cfg.ToolName {
+	if a.cfg.ViewImage && tc.Function.Name == ViewImageTool {
+		a.newViewImageCall(&c, tc.Function.Arguments)
+		return c
+	}
+	if tc.Function.Name != a.cfg.ToolName || len(a.methods) == 0 {
 		c.Status = CallDone
-		c.Result = rpcErrorResponse(nil, &RPCError{Code: CodeMethodNotFound, Message: fmt.Sprintf("unknown tool %q; the only tool is %q", tc.Function.Name, a.cfg.ToolName)})
+		c.Result = rpcErrorResponse(nil, &RPCError{Code: CodeMethodNotFound, Message: fmt.Sprintf("unknown tool %q; available tools: %s", tc.Function.Name, strings.Join(a.toolNames(), ", "))})
 		return c
 	}
 	req, rerr := parseRPCRequest(tc.Function.Arguments)
@@ -839,6 +864,20 @@ func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
 		c.RequireConfirm, c.Status = true, CallAwaitingConfirmation
 	}
 	return c
+}
+
+func (a *Agent) toolNames() []string {
+	var names []string
+	if len(a.methods) > 0 {
+		names = append(names, a.cfg.ToolName)
+	}
+	if a.cfg.ViewImage {
+		names = append(names, ViewImageTool)
+	}
+	if len(names) == 0 {
+		return []string{"(none)"}
+	}
+	return names
 }
 
 // toolMessage builds the tool message mirroring a call's current state.
@@ -1080,11 +1119,17 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	if a.cfg.OnUsage != nil {
 		a.cfg.OnUsage(ctx, rec)
 	}
+	calls := make([]RPCCall, 0, len(msg.ToolCalls))
 	for i, tc := range msg.ToolCalls {
 		c := a.newCall(msg, i, tc)
 		if err := a.createCall(ctx, st, &c); err != nil {
 			return false, err
 		}
+		calls = append(calls, c)
+	}
+	// Images go after every tool message of the turn to keep call/result pairing valid.
+	if err := a.attachImages(ctx, st, calls); err != nil {
+		return false, err
 	}
 	return len(msg.ToolCalls) > 0, nil
 }
