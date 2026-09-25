@@ -171,21 +171,8 @@ func (a *Agent) ChatMessage(ctx context.Context, raw json.RawMessage) (*RunResul
 		return nil, errors.New("agent: user message is not valid JSON")
 	}
 	return a.run(ctx, []Status{StatusIdle}, func(ctx context.Context, st *runState) error {
-		open, err := openCalls(st.db, a.store, a.sessionID)
-		if err != nil {
-			return err
-		}
-		for _, c := range open {
-			if c.Status == CallAwaitingConfirmation {
-				return ErrWaitingConfirmation
-			}
-		}
-		// Leftovers from an interrupted run: close them so the history stays valid.
-		if err := a.cancelCalls(ctx, st, open, false, &RPCError{Code: CodeCancelled, Message: "cancelled: superseded by a new user message"}); err != nil {
-			return err
-		}
-		// Messages queued while the session was idle come before the new prompt.
-		if _, err := a.drainQueue(ctx, st); err != nil {
+		// Close leftovers of an interrupted run and add queued messages first.
+		if err := a.prepareQueuedRun(ctx, st); err != nil {
 			return err
 		}
 		m, err := a.userMessage(raw)

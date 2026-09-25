@@ -199,7 +199,8 @@ a, err := client.Agent(ctx, sid, agent.AgentOptions{
 | `a.Confirm(ctx, decisions...)` | 批准 / 拒绝待确认的 RPC 调用，全部处理完后继续 loop |
 | `a.Status(ctx)` | `idle` / `running` / `stopping` / `waiting_confirmation` |
 | `a.PendingCalls(ctx)` | 待确认的 RPC 调用列表 |
-| `a.Enqueue(ctx, prompt)` | 运行中随时追加用户消息，下一次调用大模型前插入（见“消息队列”） |
+| `a.Send(ctx, prompt)` | **推荐前端统一使用**：会话空闲就直接开始对话，运行中就交给当前这次运行，不用自己判断状态（见“消息队列”） |
+| `a.Enqueue(ctx, prompt)` | 只放进队列，下一次调用大模型前插入（见“消息队列”） |
 | `a.Session(ctx)` / `a.SessionID()` / `a.Client()` | 会话信息 / 会话 ID / 所属 Client |
 
 一次运行（`Chat` / `Continue` / `Confirm`）会在以下情况返回，`RunResult.StopReason` 说明原因：
@@ -617,7 +618,20 @@ agent.Config{
 
 ### 消息队列（运行中追加用户消息）
 
-agent 执行过程中（比如正在调用工具），用户可以随时补充内容：
+**推荐用 `a.Send`**：前端发消息时不用关心会话当前在做什么：
+
+```go
+r, err := a.Send(ctx, "另外，其中一位是素食者")
+// r.Run != nil：会话原本空闲，Send 自己开始了一次运行，r.Run 是这次运行的结果（和 Chat 一样会阻塞到结束）
+// r.Queued：消息交给了正在进行的运行（由它来回答），或者排在待确认调用之后（确认后发出）
+```
+
+1. 消息先存进队列，进程崩溃也不会丢。
+2. 会话空闲时，Send 自己开始一次运行来处理这条消息。
+3. 会话正在运行时，等待当前运行在下一次调用大模型前取走这条消息，然后返回 `Queued`。**如果当前运行恰好在取走之前就结束了**（消息正好在运行结束的那一刻到达），Send 会自己再开始一次运行。所以通过 Send 发出的消息一定会得到回答。
+4. 会话在等待确认时，立即返回 `Queued`，消息会在 `Confirm` 之后发出。
+
+也可以直接使用底层的队列接口：
 
 ```go
 id, _ := a.Enqueue(ctx, "另外，其中一位是素食者")        // 或 client.Enqueue(ctx, sid, ...)

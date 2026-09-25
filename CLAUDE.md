@@ -82,7 +82,8 @@ settlement. User-facing docs are in `README.md` (Chinese).
 - `loop.go` — agent loop, call execution, tool message bookkeeping.
 - `step.go` — one streamed LLM call, throttled flushes, usage recording.
 - `compaction.go` — context window, token estimate, anchor/summary compaction.
-- `queue.go` — queued user messages, reminder injection.
+- `queue.go` — queued user messages, reminder injection, `Send` (enqueue, then
+  run if idle / wait for the active run to take it / run if it ended first).
 - `rpc.go` / `prompt.go` / `jsonschema.go` — Method/Call/Typed/NewMethod, JSON-RPC
   dispatch and result limit, system prompt + tool definition, struct-tag schemas.
 - `viewimage.go` — `view_image` tool and healing of unloadable image URLs.

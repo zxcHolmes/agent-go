@@ -147,3 +147,115 @@ func (a *Agent) hasQueued(st *runState) (bool, error) {
 	qs, err := queuedMessages(st.db, a.store, a.sessionID)
 	return len(qs) > 0, err
 }
+
+// SendResult tells how Send delivered a message.
+type SendResult struct {
+	// QueueID is the id the message had in the queue.
+	QueueID string
+	// Run is the result of the run Send started itself because the session
+	// was idle; nil when the message went to another run.
+	Run *RunResult
+	// Queued is true when the message was handed to a run that was already
+	// active (it is answered by that run), or left in the queue behind calls
+	// awaiting confirmation (it is sent once they are confirmed).
+	Queued bool
+}
+
+// Send delivers a user message whatever the session is doing, so callers do
+// not have to check the status first:
+//
+//   - idle: it starts a run like Chat and blocks until the run ends;
+//   - running / stopping: the message joins the active run's next LLM call;
+//     Send returns as soon as that run has taken it. If the run ends first
+//     (the message arrived just as it finished), Send starts a new run itself,
+//     so the message is always answered;
+//   - waiting for confirmation: the message stays queued and is sent after
+//     Confirm; Send returns immediately.
+//
+// The message is stored in the queue before anything else, so it survives a
+// crash. If ctx ends while waiting, Send returns ctx's error and the message
+// stays queued for the next run.
+func (a *Agent) Send(ctx context.Context, prompt string) (*SendResult, error) {
+	id, err := a.Enqueue(ctx, prompt)
+	if err != nil {
+		return nil, err
+	}
+	out := &SendResult{QueueID: id}
+	for {
+		res, err := a.run(ctx, []Status{StatusIdle}, func(ctx context.Context, st *runState) error {
+			n, err := a.prepareQueued(ctx, st)
+			if err == nil && n == 0 {
+				return errNothingQueued // another run already answered it
+			}
+			return err
+		}, true)
+		switch {
+		case err == nil:
+			out.Run = res
+			return out, nil
+		case errors.Is(err, ErrWaitingConfirmation), errors.Is(err, errNothingQueued):
+			out.Queued = true
+			return out, nil
+		case !errors.Is(err, ErrBusy):
+			return out, err
+		}
+		// Another run is active: wait until it takes the message or ends.
+		for {
+			if still, err := a.isQueued(ctx, id); err != nil {
+				return out, err
+			} else if !still {
+				out.Queued = true
+				return out, nil
+			}
+			s, err := getSession(ctx, a.store, a.sessionID)
+			if err != nil {
+				return out, err
+			}
+			if s.Status != StatusRunning && s.Status != StatusStopping {
+				break // it ended without our message: start a run ourselves
+			}
+			t := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return out, context.Cause(ctx)
+			case <-t.C:
+			}
+		}
+	}
+}
+
+// prepareQueuedRun is Chat's preparation without a new prompt: close calls
+// left by an interrupted run, then add the queued messages.
+func (a *Agent) prepareQueuedRun(ctx context.Context, st *runState) error {
+	_, err := a.prepareQueued(ctx, st)
+	return err
+}
+
+// errNothingQueued ends a Send run that found its message already taken.
+var errNothingQueued = errors.New("agent: nothing queued")
+
+func (a *Agent) prepareQueued(ctx context.Context, st *runState) (int, error) {
+	open, err := openCalls(st.db, a.store, a.sessionID)
+	if err != nil {
+		return 0, err
+	}
+	for _, c := range open {
+		if c.Status == CallAwaitingConfirmation {
+			return 0, ErrWaitingConfirmation
+		}
+	}
+	if err := a.cancelCalls(ctx, st, open, false, &RPCError{Code: CodeCancelled, Message: "cancelled: superseded by a new user message"}); err != nil {
+		return 0, err
+	}
+	return a.drainQueue(ctx, st)
+}
+
+func (a *Agent) isQueued(ctx context.Context, id string) (bool, error) {
+	rows, err := a.store.Query(ctx, "SELECT id FROM agent_queued_messages WHERE session_id = ? AND id = ?", a.sessionID, id)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	return rows.Next(), rows.Err()
+}

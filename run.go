@@ -217,7 +217,7 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 		status = StatusWaitingConfirmation
 	}
 	lastErr := ""
-	if err != nil && !errors.Is(err, ErrWaitingConfirmation) {
+	if err != nil && !errors.Is(err, ErrWaitingConfirmation) && !errors.Is(err, errNothingQueued) {
 		lastErr = err.Error()
 	}
 	bookErr = errors.Join(bookErr, a.release(st, status, lastErr))
@@ -239,9 +239,12 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 	attrs := []any{"session", a.sessionID, "run", st.runID, "status", string(res.Status), "stop_reason", string(res.StopReason),
 		"duration_ms", time.Since(st.start).Milliseconds(), "prompt_tokens", res.Usage.PromptTokens,
 		"completion_tokens", res.Usage.CompletionTokens, "credits", res.Cost.Total}
-	if err != nil {
+	switch {
+	case errors.Is(err, errNothingQueued):
+		a.log.Debug("send found its message already answered", attrs...)
+	case err != nil:
 		a.log.Warn("run finished with error", append(attrs, "error", err)...)
-	} else {
+	default:
 		a.log.Info("run finished", attrs...)
 	}
 	return res, err
