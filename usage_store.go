@@ -91,7 +91,7 @@ func sessionUsage(ctx context.Context, store Store, sessionID string) (*UsageSum
 func lastCallSize(ctx context.Context, store Store, sessionID string) (tokens, seq int64, ok bool, err error) {
 	rows, err := store.Query(ctx, `SELECT c.prompt_tokens + c.completion_tokens, m.seq
 		FROM agent_llm_calls c JOIN agent_messages m ON m.id = c.message_id
-		WHERE c.session_id = ? ORDER BY m.seq DESC LIMIT 1`, sessionID)
+		WHERE c.session_id = ? AND m.role = 'assistant' ORDER BY m.seq DESC LIMIT 1`, sessionID)
 	if err != nil {
 		return 0, 0, false, err
 	}

@@ -6,11 +6,29 @@ import (
 	"time"
 )
 
-// migrate creates the SDK tables if they do not exist.
+// addedColumns lists columns introduced after the first published schema
+// (v0.6.1). CREATE TABLE IF NOT EXISTS does not touch existing tables, so
+// migrate adds them to databases created by older versions.
+var addedColumns = []struct{ table, column, ddl string }{
+	{"agent_messages", "ref_seq", "BIGINT NOT NULL DEFAULT 0"}, // v0.7.0: compaction
+}
+
+// migrate creates the SDK tables if they do not exist and adds columns that
+// older versions did not have.
 func migrate(ctx context.Context, store Store) error {
 	for _, stmt := range SchemaStatements(store.Dialect()) {
 		if _, err := store.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("agent: init schema: %w", err)
+		}
+	}
+	for _, c := range addedColumns {
+		rows, err := store.Query(ctx, "SELECT "+c.column+" FROM "+c.table+" WHERE 1 = 0")
+		if err == nil {
+			rows.Close()
+			continue // already there
+		}
+		if _, err := store.Exec(ctx, "ALTER TABLE "+c.table+" ADD COLUMN "+c.column+" "+c.ddl); err != nil {
+			return fmt.Errorf("agent: add column %s.%s: %w", c.table, c.column, err)
 		}
 	}
 	return nil

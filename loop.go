@@ -52,6 +52,12 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 			return "", err
 		}
 		if !hasCalls {
+			// Messages queued while the model was answering still need an answer.
+			if queued, err := a.hasQueued(st); err != nil {
+				return "", err
+			} else if queued {
+				continue
+			}
 			return StopCompleted, nil
 		}
 	}

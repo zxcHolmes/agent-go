@@ -7,6 +7,7 @@
 - 消息按原始 JSON 字节完整保存并原样回放，保证大模型**前缀缓存**不丢失。
 - **流式输出**：助手消息边生成边写库（默认每 2 秒刷新一次，可配置），前端轮询数据库即可拿到实时内容。
 - 支持需要人工确认的 RPC 方法、Stop / Continue、跨进程的会话锁。
+- **上下文压缩**（默认“固定上个用户消息起点”，可选摘要模式）、运行中**追加用户消息队列**、每条用户消息附加 **reminder**、RPC 结果**长度保护**。
 - **崩溃恢复**：进程挂掉后，`NewClient` 启动时会把卡住的会话、写了一半的消息、执行中的工具调用恢复成一致状态，可以直接继续对话。
 
 ## 安装
@@ -162,6 +163,7 @@ sid, _ := client.CreateSession(ctx, metadata)          // 创建会话，返回 
 s, _ := client.Session(ctx, sid)                       // 会话状态、last_error、metadata
 client.Stop(ctx, sid)                                  // 不创建 agent 也能停止会话（比如“停止”按钮的接口）
 client.PendingCalls(ctx, sid)                          // 待确认的 RPC 调用
+client.Enqueue(ctx, sid, "补充一点……")                 // 运行中追加用户消息（见“消息队列”）
 client.ResetSession(ctx, sid)                          // 手动恢复单个会话（见“异常恢复”）
 client.Recover(ctx)                                    // 重新执行一次启动时的崩溃恢复
 ```
@@ -193,6 +195,7 @@ a, err := client.Agent(ctx, sid, agent.AgentOptions{
 | `a.Confirm(ctx, decisions...)` | 批准 / 拒绝待确认的 RPC 调用，全部处理完后继续 loop |
 | `a.Status(ctx)` | `idle` / `running` / `stopping` / `waiting_confirmation` |
 | `a.PendingCalls(ctx)` | 待确认的 RPC 调用列表 |
+| `a.Enqueue(ctx, prompt)` | 运行中随时追加用户消息，下一次调用大模型前插入（见“消息队列”） |
 | `a.Session(ctx)` / `a.SessionID()` / `a.Client()` | 会话信息 / 会话 ID / 所属 Client |
 
 一次运行（`Chat` / `Continue` / `Confirm`）会在以下情况返回，`RunResult.StopReason` 说明原因：
@@ -381,7 +384,7 @@ client.MessagesAfter(ctx, sid, msgID, 20)     // msgID 之后的 20 条
 client.Message(ctx, sid, msgID)               // 单条
 ```
 
-`Message` 字段：`ID`、`Seq`（会话内递增序号）、`Role`、`Kind`（普通消息为空；`view_image` 注入的图片消息为 `"view_image"`）、`Status`、`Content`（提取出的文本）、`Reasoning`（思考过程文本）、`ToolCalls`、`ToolCallID`、`Raw`（完整原始 JSON）、`CreatedAt`、`UpdatedAt`。
+`Message` 字段：`ID`、`Seq`（会话内递增序号）、`Role`、`Kind`（普通消息为空；`view_image` 注入的图片消息为 `"view_image"`；压缩点为 `"compaction"`）、`RefSeq`（压缩点之后模型从哪条消息开始看）、`Status`、`Content`（提取出的文本）、`Reasoning`（思考过程文本）、`ToolCalls`、`ToolCallID`、`Raw`（完整原始 JSON）、`CreatedAt`、`UpdatedAt`。
 
 ### 流式输出与前端轮询
 
@@ -512,11 +515,61 @@ client.MarkBilled(ctx, "你的账单号", recordIDs...)  // 已结算的记录�
 
 注意：被 Stop 打断或出错的流式请求，服务商通常不会返回 usage，这部分消耗无法记录。
 
+### 上下文压缩
+
+设置了 `ContextLength` 后，每次调用大模型前都会估算这次请求的大小。估算方法是上一次调用的真实 token 数，加上之后新增消息的字节数除以 3。超过 `CompactionThreshold`（默认 80%）时会先压缩。压缩会插入一条 `Kind = "compaction"` 的消息，**之后发给模型的历史从这条压缩消息开始**。从 session id 恢复对话时也一样；没有压缩消息就从第一条开始。数据库里的消息不会被删除，前端照常可以看到完整历史。
+
+| `Config.Compaction` | 行为 |
+| --- | --- |
+| `agent.CompactionAnchor`（默认） | **固定上个用户消息起点**：把起点移到最近一条用户消息，之前的消息不再发给模型。压缩消息只是给前端看的分隔标记（`status = excluded`） |
+| `agent.CompactionSummary` | 先让模型把要丢弃的部分总结成笔记（这次调用照常计费），笔记以 `<conversation_summary>` 用户消息的形式放在最前面，后面接最近一条用户消息及之后的内容 |
+| `agent.CompactionOff` | 不压缩，放不下时返回 `ErrContextLengthExceeded` |
+
+```go
+agent.Config{
+	ContextLength:       100000,
+	Compaction:          agent.CompactionSummary, // 默认 CompactionAnchor
+	CompactionThreshold: 0.8,
+	CompactionPrompt:    "……",                    // 可选：自定义摘要要求
+}
+```
+
+- **起点不是固定条数**：起点只在压缩的那一刻移动，两次压缩之间发送的历史开头完全不变，**前缀缓存持续有效**。实测一次对话中，每轮都命中了上一轮几乎全部的 prompt。
+- 起点总是用户消息，工具调用和结果的配对不会被截断。
+- 如果当前这一轮本身（从最近一条用户消息开始）已经太大，就没有可以丢弃的内容，会继续执行直到放不下（`ErrContextLengthExceeded`）。运行中用“消息队列”追加的用户消息也可以作为新的起点。
+- 摘要模式下，交给模型总结的对话会按 token 预算截取：每条长消息先单独截短，仍然超长时去掉中间部分，保留开头（上一次的摘要、最早的关键信息）和结尾。
+
+实测（`ContextLength: 5000`，每轮约 600 token 的长回答）：prompt 从 62 增长到 3786 token 后触发压缩，下一次请求降到 37 token（anchor 模式）或 224 token（summary 模式，模型依然记得最开始告诉它的暗号）。
+
+### 消息队列（运行中追加用户消息）
+
+agent 执行过程中（比如正在调用工具），用户可以随时补充内容：
+
+```go
+id, _ := a.Enqueue(ctx, "另外，其中一位是素食者")        // 或 client.Enqueue(ctx, sid, ...)
+client.QueuedMessages(ctx, sid)                          // 还在队列里、没发出去的消息
+client.CancelQueued(ctx, sid, id)                        // 发出去之前可以撤回
+client.EnqueueMessage(ctx, sid, rawJSON)                 // 多模态消息
+```
+
+- 队列存在数据库里（`agent_queued_messages`）。**下一次调用大模型之前**，队列中的所有消息按顺序各自作为一条 `role=user` 消息插入对话，同时从队列中删除，然后一次性发给模型。
+- 如果模型已经给出最终回答，队列里却还有消息，agent 会继续下一轮，回应这些补充内容，不会把它们漏掉。
+- 会话空闲时入队的消息，会在下一次 `Chat` / `Continue` 开始时插入，排在新问题之前。
+- 插入时使用确定性的消息 ID（`msg_<队列ID>`），进程崩溃也不会重复插入。
+
+### Reminder
+
+```go
+agent.Config{Reminder: "回答要简洁，金额一律用人民币。"}
+```
+
+每条用户消息（`Chat`、`ChatMessage`、队列消息）发给模型时，末尾都会附加 `<reminder>…</reminder>`。多模态消息则追加一个文本片段。附加后的内容会写进 `raw`，以后重放时字节不变，不影响前缀缓存；`Message.Content` 里保存的仍是用户输入的原文，前端不会显示 reminder。
+
 ### 前缀缓存
 
 - 每条消息保存完整原始 JSON（`raw` 列），请求时按原字节回放，不做改写或截断。
 - 系统提示词和工具定义是确定性生成的（方法按名称排序），请保持 `SystemPrompt`、`RPCDoc`、`Methods` 稳定。
-- `ContextLength` 只用于估算和限制 `max_tokens`，超出时返回 `ErrContextLengthExceeded`，不会偷偷裁剪历史破坏缓存。
+- 历史只在压缩时才会改变起点（见“上下文压缩”），两次压缩之间发给模型的前缀完全不变。
 
 ### 存储层
 
@@ -533,6 +586,8 @@ type Store interface {
 // Rows 与 *sql.Rows 一致：Next / Scan / Err / Close
 ```
 
+升级 SDK 后，`NewClient` 会自动为旧版本建好的表补上新增的列（`ALTER TABLE … ADD COLUMN`），不需要手动迁移。
+
 表结构（前缀 `agent_`，时间统一为毫秒时间戳 BIGINT）：
 
 | 表 | 内容 |
@@ -540,6 +595,7 @@ type Store interface {
 | `agent_sessions` | 会话、状态、运行锁、last_error、metadata |
 | `agent_messages` | 消息，`(session_id, seq)` 唯一，`raw` 为完整原始 JSON，`status` 为流式 / 执行状态 |
 | `agent_llm_calls` | 每次 LLM 调用的全部 token 字段、原始 usage、积分、延迟、结算状态（`bill_id` / `claimed_at` / `billed_at`） |
+| `agent_queued_messages` | 运行中追加、还没发给模型的用户消息 |
 | `agent_rpc_calls` | 每次 RPC 调用：方法、参数、状态、确认、JSON-RPC 结果 |
 
 ### 其他配置
@@ -547,6 +603,9 @@ type Store interface {
 | 字段 | 说明 |
 | --- | --- |
 | `ViewImage` / `ViewImageDetail` | 开启内置的 `view_image` 工具 / 设置 `image_url.detail`，见“查看图片” |
+| `Compaction` / `CompactionThreshold` / `CompactionPrompt` | 上下文压缩策略 / 触发比例（默认 0.8）/ 摘要提示词，见“上下文压缩” |
+| `Reminder` | 附加在每条用户消息后的 `<reminder>` 内容 |
+| `MaxRPCResultChars` | 单次 RPC 返回给模型的最大字符数（按字符计，中文不会被截成乱码）。超出部分会被截掉，并附上说明省略了多少字符；返回内容仍是合法 JSON。0 表示不限制 |
 | `SkipSchema` | `NewClient` 不建表（自己用 `SchemaStatements` 做迁移） |
 | `RecoverStaleAfter` | `NewClient` 只恢复超过这个时长没有心跳的会话，多实例部署时使用；0 表示恢复全部 |
 | `StreamFlushInterval` | 流式输出时写库的间隔，默认 2 秒 |

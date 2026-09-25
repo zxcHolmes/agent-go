@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 )
 
 // Client is the entry point of the SDK. It holds the store and the shared
@@ -88,6 +90,35 @@ func (c *Client) Stop(ctx context.Context, sessionID string) error {
 // PendingCalls returns the RPC calls of a session waiting for confirmation.
 func (c *Client) PendingCalls(ctx context.Context, sessionID string) ([]RPCCall, error) {
 	return pendingCalls(ctx, c.store, sessionID)
+}
+
+// ---- queue ----
+
+// Enqueue queues a user message for a session; see Agent.Enqueue.
+func (c *Client) Enqueue(ctx context.Context, sessionID, prompt string) (string, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", errors.New("agent: empty prompt")
+	}
+	raw, err := userRaw(prompt)
+	if err != nil {
+		return "", err
+	}
+	return enqueue(ctx, c.store, sessionID, raw)
+}
+
+// EnqueueMessage queues a caller-built user message (e.g. multimodal content).
+func (c *Client) EnqueueMessage(ctx context.Context, sessionID string, raw json.RawMessage) (string, error) {
+	return enqueue(ctx, c.store, sessionID, raw)
+}
+
+// QueuedMessages lists the messages of a session still waiting in the queue.
+func (c *Client) QueuedMessages(ctx context.Context, sessionID string) ([]QueuedMessage, error) {
+	return queuedMessages(ctx, c.store, sessionID)
+}
+
+// CancelQueued removes a message from the queue if it has not been sent yet.
+func (c *Client) CancelQueued(ctx context.Context, sessionID, queueID string) error {
+	return cancelQueued(ctx, c.store, sessionID, queueID)
 }
 
 // ---- messages ----

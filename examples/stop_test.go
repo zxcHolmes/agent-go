@@ -220,8 +220,8 @@ func TestStopDeadRun(t *testing.T) {
 	if _, err := e.store.Exec(ctx, "UPDATE agent_sessions SET status = 'running', run_id = 'run_dead', updated_at = ? WHERE id = ?", old, a.SessionID()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.store.Exec(ctx, `INSERT INTO agent_messages (id, session_id, seq, role, kind, status, content, reasoning, tool_call_id, raw, created_at, updated_at)
-		VALUES ('msg_dead', ?, 1, 'assistant', '', 'streaming', 'half', '', '', '{"role":"assistant","content":"half"}', ?, ?)`, a.SessionID(), old, old); err != nil {
+	if _, err := e.store.Exec(ctx, `INSERT INTO agent_messages (id, session_id, seq, role, kind, ref_seq, status, content, reasoning, tool_call_id, raw, created_at, updated_at)
+		VALUES ('msg_dead', ?, 1, 'assistant', '', 0, 'streaming', 'half', '', '', '{"role":"assistant","content":"half"}', ?, ?)`, a.SessionID(), old, old); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Stop(ctx); err != nil {

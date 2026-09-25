@@ -34,6 +34,7 @@ func tableDefs(text string) []tableDef {
 				"seq BIGINT NOT NULL",
 				"role VARCHAR(32) NOT NULL",
 				"kind VARCHAR(32) NOT NULL",
+				"ref_seq BIGINT NOT NULL",
 				"status VARCHAR(32) NOT NULL",
 				"content " + text + " NOT NULL",
 				"reasoning " + text + " NOT NULL",
@@ -80,6 +81,17 @@ func tableDefs(text string) []tableDef {
 				{"idx_agent_llm_calls_unbilled", "billed_at, session_id"},
 				{"idx_agent_llm_calls_bill", "bill_id"},
 			},
+		},
+		{
+			name: "agent_queued_messages",
+			columns: []string{
+				"id VARCHAR(64) NOT NULL PRIMARY KEY",
+				"session_id VARCHAR(64) NOT NULL",
+				"content " + text + " NOT NULL",
+				"raw " + text + " NOT NULL",
+				"created_at BIGINT NOT NULL",
+			},
+			indexes: [][2]string{{"idx_agent_queued_messages_session", "session_id, created_at"}},
 		},
 		{
 			name: "agent_rpc_calls",

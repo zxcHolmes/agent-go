@@ -36,9 +36,10 @@ type Config struct {
 	Model   string
 
 	// ContextLength is the model context window in tokens. When set, the agent
-	// estimates the prompt size before each call, fails with
-	// ErrContextLengthExceeded when it no longer fits, and caps max_tokens to
-	// the remaining room. 0 disables the check.
+	// estimates the prompt size before each call, compacts the history when
+	// it passes CompactionThreshold (see Compaction), caps max_tokens to the
+	// remaining room, and fails with ErrContextLengthExceeded when even the
+	// compacted history does not fit. 0 disables all of this.
 	ContextLength int
 	// MaxOutputTokens is sent as max_tokens (0 = provider default).
 	MaxOutputTokens int
@@ -67,6 +68,28 @@ type Config struct {
 	// (e.g. DeepSeek thinking mode with tool calls), others reject it. The
 	// reasoning is always stored in Message.Reasoning either way.
 	KeepReasoning bool
+
+	// Compaction selects how the history is shortened when a request would
+	// use more than CompactionThreshold of ContextLength (default
+	// CompactionAnchor). Requires ContextLength.
+	Compaction CompactionMode
+	// CompactionThreshold is the fraction of ContextLength that triggers
+	// compaction before an LLM call (default 0.8).
+	CompactionThreshold float64
+	// CompactionPrompt is the instruction given to the model when writing a
+	// summary in CompactionSummary mode (a sensible default is used).
+	CompactionPrompt string
+
+	// Reminder is appended to every user message as
+	// "<reminder>...</reminder>" (Chat, ChatMessage and queued messages). It
+	// is stored in the raw message sent to the model; Message.Content keeps
+	// the text without it.
+	Reminder string
+
+	// MaxRPCResultChars caps the size (in characters) of what one RPC call
+	// returns to the model; longer results and error messages are cut with a
+	// note saying how much was dropped. 0 means no limit.
+	MaxRPCResultChars int
 
 	// ToolName is the name of the JSON-RPC tool (default "json_rpc").
 	ToolName string
@@ -118,7 +141,30 @@ type AgentOptions struct {
 }
 
 // withDefaults fills in zero values.
+// CompactionMode selects the context compaction strategy.
+type CompactionMode string
+
+const (
+	// CompactionAnchor (default) moves the start of the history sent to the
+	// model to the most recent user message. Older messages stay stored and
+	// visible but are no longer sent. The start only moves on compaction, so
+	// the provider prefix cache keeps working between compactions.
+	CompactionAnchor CompactionMode = "anchor"
+	// CompactionSummary does the same, but first asks the model to summarize
+	// the dropped messages; the summary is sent in their place.
+	CompactionSummary CompactionMode = "summary"
+	// CompactionOff never compacts; requests that no longer fit fail with
+	// ErrContextLengthExceeded.
+	CompactionOff CompactionMode = "off"
+)
+
 func (cfg Config) withDefaults() Config {
+	if cfg.Compaction == "" {
+		cfg.Compaction = CompactionAnchor
+	}
+	if cfg.CompactionThreshold <= 0 || cfg.CompactionThreshold >= 1 {
+		cfg.CompactionThreshold = 0.8
+	}
 	if cfg.ToolName == "" {
 		cfg.ToolName = "json_rpc"
 	}

@@ -137,10 +137,7 @@ func (a *Agent) Chat(ctx context.Context, prompt string) (*RunResult, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return nil, errors.New("agent: empty prompt")
 	}
-	raw, err := marshalJSON(struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}{"user", prompt})
+	raw, err := userRaw(prompt)
 	if err != nil {
 		return nil, err
 	}
@@ -167,9 +164,24 @@ func (a *Agent) ChatMessage(ctx context.Context, raw json.RawMessage) (*RunResul
 		if err := a.cancelCalls(ctx, st, open, false, &RPCError{Code: CodeCancelled, Message: "cancelled: superseded by a new user message"}); err != nil {
 			return err
 		}
-		m := newMessage(a.sessionID, raw, MessageDone)
+		// Messages queued while the session was idle come before the new prompt.
+		if _, err := a.drainQueue(ctx, st); err != nil {
+			return err
+		}
+		m, err := a.userMessage(raw)
+		if err != nil {
+			return err
+		}
 		return a.insertMessage(ctx, st, &m)
 	}, true)
+}
+
+// Enqueue adds a user message to the conversation without waiting for the
+// current run: it joins right before the agent's next LLM call (or at the
+// start of the next Chat / Continue if the session is idle). Use it to let
+// users add details while the agent is working. It returns the queue id.
+func (a *Agent) Enqueue(ctx context.Context, prompt string) (string, error) {
+	return a.client.Enqueue(ctx, a.sessionID, prompt)
 }
 
 // Continue resumes the loop without a new user message, e.g. after Stop, an

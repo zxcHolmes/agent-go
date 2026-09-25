@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -40,12 +39,10 @@ func (a *Agent) assistantRaw(content, reasoning string, calls []ToolCall) json.R
 // the first delta, flushed every StreamFlushInterval, and finalised when the
 // stream ends (or marked interrupted if it breaks).
 func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
-	history, err := allMessages(st.db, a.store, a.sessionID)
-	if err != nil {
+	if _, err := a.drainQueue(ctx, st); err != nil {
 		return false, err
 	}
-	history = replayable(history)
-	maxTokens, err := a.maxTokens(st, history)
+	history, maxTokens, err := a.prepareContext(ctx, st)
 	if err != nil {
 		return false, err
 	}
@@ -150,24 +147,18 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	}
 
 	usage := parseUsage(res.Usage)
-	var cost Cost
-	if a.cfg.Billing != nil {
-		cost = a.cfg.Billing.Cost(a.cfg.Model, usage)
-	}
-	rec := UsageRecord{
+	rec := &UsageRecord{
 		ID: newID("llm"), SessionID: a.sessionID, MessageID: msg.ID, Model: a.cfg.Model,
 		ResponseID: res.ID, FinishReason: res.FinishReason, Usage: usage, RawUsage: res.Usage,
-		Cost: cost, LatencyMs: latency, CreatedAt: time.Now(),
+		LatencyMs: latency, CreatedAt: time.Now(),
 	}
-	if err := insertUsage(st.db, a.store, &rec); err != nil {
+	if a.cfg.Billing != nil {
+		rec.Cost = a.cfg.Billing.Cost(a.cfg.Model, usage)
+	}
+	if err := a.recordUsage(ctx, st, rec); err != nil {
 		return false, err
 	}
-	st.res.Usage.add(usage)
-	st.res.Cost.add(cost)
 	st.res.FinishReason = res.FinishReason
-	if a.cfg.OnUsage != nil {
-		a.cfg.OnUsage(ctx, rec)
-	}
 	calls := make([]RPCCall, 0, len(msg.ToolCalls))
 	for i, tc := range msg.ToolCalls {
 		c := a.newCall(msg, i, tc)
@@ -199,37 +190,15 @@ func replayable(ms []Message) []Message {
 	return out
 }
 
-// maxTokens estimates the prompt size (exact token count of the previous
-// call plus ~3 bytes per token for newer messages) and returns the output
-// budget.
-func (a *Agent) maxTokens(st *runState, history []Message) (int, error) {
-	out := a.cfg.MaxOutputTokens
-	if a.cfg.ContextLength <= 0 {
-		return out, nil
+// recordUsage stores one LLM call's usage and adds it to the run totals.
+func (a *Agent) recordUsage(ctx context.Context, st *runState, rec *UsageRecord) error {
+	if err := insertUsage(st.db, a.store, rec); err != nil {
+		return err
 	}
-	used, afterSeq, ok, err := lastCallSize(st.db, a.store, a.sessionID)
-	if err != nil {
-		return 0, err
+	st.res.Usage.add(rec.Usage)
+	st.res.Cost.add(rec.Cost)
+	if a.cfg.OnUsage != nil {
+		a.cfg.OnUsage(ctx, *rec)
 	}
-	est := int(used)
-	if !ok {
-		est = len(a.system) / 3
-		for _, t := range a.tools {
-			est += len(t) / 3
-		}
-		afterSeq = 0
-	}
-	for _, m := range history {
-		if m.Seq > afterSeq {
-			est += len(m.Raw)/3 + 4
-		}
-	}
-	remaining := a.cfg.ContextLength - est
-	if remaining <= 0 {
-		return 0, fmt.Errorf("%w (estimated %d of %d tokens)", ErrContextLengthExceeded, est, a.cfg.ContextLength)
-	}
-	if out <= 0 || out > remaining {
-		out = remaining
-	}
-	return out, nil
+	return nil
 }

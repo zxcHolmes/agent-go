@@ -72,6 +72,13 @@ const (
 // as something the user typed.
 const MessageKindViewImage = "view_image"
 
+// MessageKindCompaction marks where the context was compacted (see
+// Config.Compaction). Messages before its RefSeq are no longer sent to the
+// model. In summary mode its content is the summary, sent to the model in
+// place of the dropped messages (status done); in anchor mode it is only a
+// marker for the UI (status excluded).
+const MessageKindCompaction = "compaction"
+
 // Final reports whether the message will not change anymore.
 func (s MessageStatus) Final() bool {
 	return s == MessageDone || s == MessageInterrupted || s == MessageExcluded
@@ -113,11 +120,14 @@ type Session struct {
 // final it never changes and is replayed byte-for-byte so provider prefix
 // caches stay valid. Content, ToolCalls and ToolCallID are decoded from Raw.
 type Message struct {
-	ID         string          `json:"id"`
-	SessionID  string          `json:"session_id"`
-	Seq        int64           `json:"seq"`
-	Role       string          `json:"role"`
-	Kind       string          `json:"kind,omitempty"` // "" for regular messages; MessageKindViewImage for injected images
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	Seq       int64  `json:"seq"`
+	Role      string `json:"role"`
+	Kind      string `json:"kind,omitempty"` // "" for regular messages, or a MessageKind* constant
+	// RefSeq is set on compaction messages: the seq of the first message the
+	// model still sees verbatim after this compaction.
+	RefSeq     int64           `json:"ref_seq,omitempty"`
 	Status     MessageStatus   `json:"status"`
 	Content    string          `json:"content"`
 	Reasoning  string          `json:"reasoning,omitempty"` // streamed reasoning / thinking text

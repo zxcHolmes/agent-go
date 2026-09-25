@@ -239,7 +239,7 @@ func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage)
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			resp = rpcErrorResponse(rec.RPCID, &RPCError{Code: CodeInternalError, Message: fmt.Sprintf("panic: %v", r), Data: string(debug.Stack())})
+			resp = rpcErrorResponse(rec.RPCID, a.limitError(&RPCError{Code: CodeInternalError, Message: fmt.Sprintf("panic: %v", r), Data: string(debug.Stack())}))
 		}
 	}()
 	result, err := m.Handler(context.WithValue(ctx, callKey{}, call), call)
@@ -248,9 +248,9 @@ func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage)
 		if !errors.As(err, &re) {
 			re = &RPCError{Code: CodeInternalError, Message: err.Error()}
 		}
-		return rpcErrorResponse(rec.RPCID, re)
+		return rpcErrorResponse(rec.RPCID, a.limitError(re))
 	}
-	out, err := rpcResultResponse(rec.RPCID, result)
+	out, err := rpcResultResponse(rec.RPCID, a.limitResult(result))
 	if err != nil {
 		return rpcErrorResponse(rec.RPCID, &RPCError{Code: CodeInternalError, Message: "encode result: " + err.Error()})
 	}
@@ -268,4 +268,42 @@ func (a *Agent) methodNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// limitResult enforces Config.MaxRPCResultChars on a handler result. An
+// oversized result is replaced by a string holding the start of its JSON and
+// a note, so the response stays valid JSON.
+func (a *Agent) limitResult(result any) any {
+	n := a.cfg.MaxRPCResultChars
+	if n <= 0 {
+		return result
+	}
+	b, err := marshalJSON(result)
+	if err != nil {
+		return result // reported by rpcResultResponse
+	}
+	if cut, dropped := truncateRunes(string(b), n); dropped > 0 {
+		return fmt.Sprintf("%s…[truncated: %d more characters not shown]", cut, dropped)
+	}
+	return json.RawMessage(b)
+}
+
+// limitError enforces Config.MaxRPCResultChars on an error's message and data.
+func (a *Agent) limitError(e *RPCError) *RPCError {
+	n := a.cfg.MaxRPCResultChars
+	if n <= 0 {
+		return e
+	}
+	out := *e
+	if cut, dropped := truncateRunes(out.Message, n); dropped > 0 {
+		out.Message = fmt.Sprintf("%s…[truncated: %d more characters not shown]", cut, dropped)
+	}
+	if out.Data != nil {
+		if b, err := marshalJSON(out.Data); err == nil {
+			if cut, dropped := truncateRunes(string(b), n); dropped > 0 {
+				out.Data = fmt.Sprintf("%s…[truncated: %d more characters not shown]", cut, dropped)
+			}
+		}
+	}
+	return &out
 }
