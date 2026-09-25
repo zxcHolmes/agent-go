@@ -50,23 +50,43 @@ type Config struct {
 	// Billing prices every LLM call in credits. Optional.
 	Billing Billing
 
+	// StreamFlushInterval is how often a streaming assistant message is
+	// written to the store (default 2s). The message row is created on the
+	// first delta and always written once more when the stream ends.
+	StreamFlushInterval time.Duration
+	// StreamIdleTimeout aborts a stream that sends nothing for this long
+	// (default 2m, negative disables).
+	StreamIdleTimeout time.Duration
+	// KeepReasoning includes streamed reasoning text as "reasoning_content" in
+	// the assistant message replayed to the model. Some providers require it
+	// (e.g. DeepSeek thinking mode with tool calls), others reject it. The
+	// reasoning is always stored in Message.Reasoning either way.
+	KeepReasoning bool
+
 	// ToolName is the name of the single JSON-RPC tool (default "json_rpc").
 	ToolName string
 	// MaxSteps bounds LLM calls per run (default 50).
 	MaxSteps int
 	// ExtraBody is merged into every request body (temperature, top_p,
-	// reasoning_effort, ...). It cannot override model, messages or tools.
+	// reasoning_effort, ...). It cannot override model, messages, tools or
+	// stream; a nil value removes a default field such as "stream_options".
 	ExtraBody map[string]any
 	// Headers are added to every LLM request.
 	Headers    map[string]string
 	HTTPClient *http.Client
-	// MaxRetries for 429/5xx/network errors (default 2, negative disables).
+	// MaxRetries for 429/5xx/network errors before any output was streamed
+	// (default 2, negative disables).
 	MaxRetries int
 	// StaleAfter is how long a "running" session may go without a heartbeat
-	// before another run may take it over, e.g. after a crash (default 15m).
+	// before another run may take it over (default 1m). Runs heartbeat in the
+	// background every few seconds.
 	StaleAfter time.Duration
 
-	// OnMessage is called after each message is persisted.
+	// OnStream is called for every streamed text delta (the store is only
+	// written every StreamFlushInterval).
+	OnStream func(ctx context.Context, messageID, content, reasoning string)
+	// OnMessage is called after a message is inserted or updated in the store,
+	// including throttled streaming flushes and tool status changes.
 	OnMessage func(ctx context.Context, m Message)
 	// OnUsage is called after each LLM call is recorded, e.g. to deduct credits.
 	OnUsage func(ctx context.Context, r UsageRecord)
@@ -106,22 +126,31 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		cfg.MaxRetries = 0
 	}
 	if cfg.StaleAfter <= 0 {
-		cfg.StaleAfter = 15 * time.Minute
+		cfg.StaleAfter = time.Minute
+	}
+	if cfg.StreamFlushInterval <= 0 {
+		cfg.StreamFlushInterval = 2 * time.Second
+	}
+	if cfg.StreamIdleTimeout == 0 {
+		cfg.StreamIdleTimeout = 2 * time.Minute
+	} else if cfg.StreamIdleTimeout < 0 {
+		cfg.StreamIdleTimeout = 0
 	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 10 * time.Minute}
+		httpClient = &http.Client{} // no overall timeout: streams can be long; see StreamIdleTimeout
 	}
 	a := &Agent{
 		cfg:     cfg,
 		store:   cfg.Store,
 		methods: make(map[string]Method, len(cfg.Methods)),
 		llm: &llmClient{
-			endpoint:   chatEndpoint(cfg.BaseURL),
-			apiKey:     cfg.APIKey,
-			headers:    cfg.Headers,
-			http:       httpClient,
-			maxRetries: cfg.MaxRetries,
+			endpoint:    chatEndpoint(cfg.BaseURL),
+			apiKey:      cfg.APIKey,
+			headers:     cfg.Headers,
+			http:        httpClient,
+			maxRetries:  cfg.MaxRetries,
+			idleTimeout: cfg.StreamIdleTimeout,
 		},
 	}
 	for _, m := range cfg.Methods {
@@ -202,6 +231,11 @@ func (a *Agent) MessagesAfter(ctx context.Context, messageID string, limit int) 
 	return MessagesAfter(ctx, a.store, a.sessionID, messageID, limit)
 }
 
+// GetMessage loads one message of the session.
+func (a *Agent) GetMessage(ctx context.Context, messageID string) (*Message, error) {
+	return GetMessage(ctx, a.store, a.sessionID, messageID)
+}
+
 // Usage sums token usage and credits of the session.
 func (a *Agent) Usage(ctx context.Context) (*UsageSummary, error) {
 	return SessionUsage(ctx, a.store, a.sessionID)
@@ -209,7 +243,7 @@ func (a *Agent) Usage(ctx context.Context) (*UsageSummary, error) {
 
 // Chat appends a user message and runs the agent loop until the model answers
 // without tool calls, a call needs confirmation, Stop is called, or MaxSteps
-// is reached. It blocks for the whole run.
+// is reached. It blocks for the whole run; poll the store for progress.
 func (a *Agent) Chat(ctx context.Context, prompt string) (*RunResult, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return nil, errors.New("agent: empty prompt")
@@ -231,7 +265,7 @@ func (a *Agent) ChatMessage(ctx context.Context, raw json.RawMessage) (*RunResul
 		return nil, errors.New("agent: user message is not valid JSON")
 	}
 	return a.run(ctx, []Status{StatusIdle}, func(ctx context.Context, st *runState) error {
-		open, err := a.openCalls(st)
+		open, err := openCalls(st.db, a.store, a.sessionID)
 		if err != nil {
 			return err
 		}
@@ -244,13 +278,13 @@ func (a *Agent) ChatMessage(ctx context.Context, raw json.RawMessage) (*RunResul
 		if err := a.cancelCalls(ctx, st, open, "cancelled: superseded by a new user message"); err != nil {
 			return err
 		}
-		_, err = a.appendMessage(ctx, st, raw)
-		return err
+		m := newMessage(a.sessionID, raw, MessageDone)
+		return a.insertMessage(ctx, st, &m)
 	})
 }
 
 // Continue resumes the loop without a new user message, e.g. after Stop, an
-// error, or a truncated answer. Unfinished RPC calls are executed first.
+// error, a crash or a truncated answer.
 func (a *Agent) Continue(ctx context.Context) (*RunResult, error) {
 	return a.run(ctx, []Status{StatusIdle}, nil)
 }
@@ -278,16 +312,15 @@ func (a *Agent) Confirm(ctx context.Context, decisions ...Decision) (*RunResult,
 		for _, d := range decisions {
 			c := byID[d.CallID]
 			if d.Approve {
-				c.Status = CallApproved
+				err = setCallStatus(st.db, a.store, c, CallApproved)
 			} else {
 				msg := "rejected by user"
 				if d.Reason != "" {
 					msg += ": " + d.Reason
 				}
-				c.Status = CallRejected
-				c.Result = rpcErrorResponse(c.RPCID, &RPCError{Code: CodeRejected, Message: msg})
+				err = a.completeCall(ctx, st, c, CallRejected, rpcErrorResponse(c.RPCID, &RPCError{Code: CodeRejected, Message: msg}))
 			}
-			if err := updateCall(st.db, a.store, c); err != nil {
+			if err != nil {
 				return err
 			}
 		}
@@ -296,9 +329,10 @@ func (a *Agent) Confirm(ctx context.Context, decisions ...Decision) (*RunResult,
 }
 
 // Stop interrupts the running loop of this session, in this process or
-// another one (the loop checks a stop flag before every step). Calls not yet
-// executed are cancelled; the session becomes idle (or waiting_confirmation
-// if calls still await approval). Stop returns immediately.
+// another one. A streaming answer keeps its partial text (status
+// "interrupted"); calls not yet executed are cancelled; the session becomes
+// idle (or waiting_confirmation if calls still await approval). Stop returns
+// immediately.
 func (a *Agent) Stop(ctx context.Context) error {
 	if v, ok := running.Load(a.sessionID); ok {
 		v.(*localRun).cancel(ErrStopped)
@@ -317,10 +351,11 @@ type localRun struct {
 }
 
 type runState struct {
-	runID  string
-	db     context.Context // not cancelled by Stop, so bookkeeping always completes
-	cancel context.CancelCauseFunc
-	res    *RunResult
+	runID    string
+	db       context.Context // not cancelled by Stop, so bookkeeping always completes
+	cancel   context.CancelCauseFunc
+	startSeq int64 // messages with a greater seq were produced by this run
+	res      *RunResult
 }
 
 func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Context, *runState) error) (*RunResult, error) {
@@ -335,20 +370,118 @@ func (a *Agent) run(ctx context.Context, from []Status, prepare func(context.Con
 	defer running.CompareAndDelete(a.sessionID, lr)
 
 	st := &runState{runID: runID, db: context.WithoutCancel(ctx), cancel: cancel, res: &RunResult{SessionID: a.sessionID}}
+	hbDone := a.heartbeat(runCtx, st)
+	defer hbDone()
+
 	var reason StopReason
-	if prepare != nil {
+	err = a.heal(runCtx, st)
+	if err == nil && prepare != nil {
 		err = prepare(runCtx, st)
 	}
 	if err == nil {
 		reason, err = a.loop(runCtx, st)
 	}
+	hbDone()
 	return a.finish(runCtx, st, reason, err)
+}
+
+// heartbeat keeps the session lock fresh while the run is alive and relays
+// stop requests from other processes, even in the middle of a stream or a
+// long RPC call. The returned func stops it and waits for it to exit.
+func (a *Agent) heartbeat(ctx context.Context, st *runState) func() {
+	every := a.cfg.StaleAfter / 4
+	if every > 5*time.Second {
+		every = 5 * time.Second
+	}
+	if every < 100*time.Millisecond {
+		every = 100 * time.Millisecond
+	}
+	quit := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := a.checkpoint(ctx, st); errors.Is(err, ErrLockLost) {
+					st.cancel(ErrLockLost)
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(quit) })
+		<-exited
+	}
+}
+
+// heal brings the session back to a consistent state before running: it
+// repairs leftovers of a crashed run (for sessions taken over without Init)
+// and records tool calls whose records or tool messages were never written.
+func (a *Agent) heal(ctx context.Context, st *runState) error {
+	if err := recoverSessionData(st.db, a.store, a.sessionID); err != nil {
+		return err
+	}
+	last, err := LatestMessages(st.db, a.store, a.sessionID, 1)
+	if err != nil {
+		return err
+	}
+	if len(last) > 0 {
+		st.startSeq = last[0].Seq
+	}
+	return a.reconcileCalls(ctx, st)
+}
+
+// reconcileCalls makes sure every tool call of the latest assistant message
+// has an RPC call record and a tool message (a crash between writes can leave
+// either missing).
+func (a *Agent) reconcileCalls(ctx context.Context, st *runState) error {
+	msg, err := lastAssistant(st.db, a.store, a.sessionID)
+	if err != nil || msg == nil || len(msg.ToolCalls) == 0 {
+		return err
+	}
+	calls, err := callsForMessage(st.db, a.store, msg.ID)
+	if err != nil {
+		return err
+	}
+	byIndex := make(map[int]*RPCCall, len(calls))
+	for i := range calls {
+		byIndex[calls[i].Index] = &calls[i]
+	}
+	for i, tc := range msg.ToolCalls {
+		c := byIndex[i]
+		if c == nil {
+			nc := a.newCall(msg, i, tc)
+			if err := a.createCall(ctx, st, &nc); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := GetMessage(st.db, a.store, a.sessionID, c.ResultMessageID); errors.Is(err, ErrMessageNotFound) {
+			m := a.toolMessage(c)
+			m.ID = c.ResultMessageID
+			if err := a.insertMessage(ctx, st, &m); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, err error) (*RunResult, error) {
 	res := st.res
-	if errors.Is(err, ErrLockLost) {
-		return res, err
+	if errors.Is(err, ErrLockLost) || errors.Is(context.Cause(runCtx), ErrLockLost) {
+		return res, ErrLockLost
 	}
 	interrupted := err != nil && runCtx.Err() != nil
 	stopped := interrupted && errors.Is(context.Cause(runCtx), ErrStopped)
@@ -375,10 +508,12 @@ func (a *Agent) finish(runCtx context.Context, st *runState, reason StopReason, 
 		lastErr = err.Error()
 	}
 	bookErr = errors.Join(bookErr, a.release(st, status, lastErr))
+	msgs, merr := messagesAfterSeq(st.db, a.store, a.sessionID, st.startSeq)
+	bookErr = errors.Join(bookErr, merr)
 	if bookErr != nil {
 		err = errors.Join(err, bookErr)
 	}
-	res.Status, res.PendingCalls = status, pending
+	res.Status, res.PendingCalls, res.Messages = status, pending, msgs
 	switch {
 	case err != nil:
 	case stopped:
@@ -468,6 +603,19 @@ func (a *Agent) checkpoint(ctx context.Context, st *runState) error {
 	return nil
 }
 
+// ownsLock reports whether this run still holds the session, e.g. after a
+// long RPC call during which Init may have recovered the session.
+func (a *Agent) ownsLock(st *runState) error {
+	owner, _, err := a.sessionLock(st.db)
+	if err != nil {
+		return err
+	}
+	if owner != st.runID {
+		return ErrLockLost
+	}
+	return nil
+}
+
 func (a *Agent) release(st *runState, status Status, lastErr string) error {
 	_, err := a.store.Exec(st.db, "UPDATE agent_sessions SET status = ?, run_id = '', stop_requested = 0, last_error = ?, updated_at = ? WHERE id = ? AND run_id = ?",
 		string(status), lastErr, nowMillis(), a.sessionID, st.runID)
@@ -480,7 +628,7 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 		if err := a.checkpoint(ctx, st); err != nil {
 			return "", err
 		}
-		open, err := a.openCalls(st)
+		open, err := openCalls(st.db, a.store, a.sessionID)
 		if err != nil {
 			return "", err
 		}
@@ -490,12 +638,7 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 				c := &open[i]
 				switch c.Status {
 				case CallQueued, CallApproved:
-					if err := a.checkpoint(ctx, st); err != nil {
-						return "", err
-					}
-					c.Result = a.invoke(ctx, c)
-					c.Status = CallDone
-					if err := updateCall(st.db, a.store, c); err != nil {
+					if err := a.execute(ctx, st, c); err != nil {
 						return "", err
 					}
 				case CallAwaitingConfirmation:
@@ -504,9 +647,6 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 			}
 			if waiting {
 				return StopWaitingConfirmation, nil
-			}
-			if err := a.flushResults(ctx, st, open); err != nil {
-				return "", err
 			}
 			continue
 		}
@@ -524,36 +664,28 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 	}
 }
 
-// openCalls returns calls without a written tool result. If the last message
-// requested tool calls that were never recorded (crash between writes), it
-// records them first.
-func (a *Agent) openCalls(st *runState) ([]RPCCall, error) {
-	open, err := openCalls(st.db, a.store, a.sessionID)
-	if err != nil || len(open) > 0 {
-		return open, err
+// execute runs one call. The tool message is marked "running" before the
+// handler starts, so a crash mid-call is visible and recoverable.
+func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
+	if err := a.checkpoint(ctx, st); err != nil {
+		return err
 	}
-	last, err := lastMessage(st.db, a.store, a.sessionID)
-	if err != nil || last == nil || last.Role != "assistant" || len(last.ToolCalls) == 0 {
-		return nil, err
+	if err := setCallStatus(st.db, a.store, c, CallRunning); err != nil {
+		return err
 	}
-	existing, err := callsForMessage(st.db, a.store, last.ID)
-	if err != nil || len(existing) > 0 {
-		return nil, err
+	a.notify(ctx, st, c.ResultMessageID)
+	result := a.invoke(ctx, c)
+	if err := a.ownsLock(st); err != nil {
+		return err // the session was recovered meanwhile; do not overwrite it
 	}
-	for i, tc := range last.ToolCalls {
-		c := a.newCall(last, i, tc)
-		if err := insertCall(st.db, a.store, &c); err != nil {
-			return nil, err
-		}
-	}
-	return openCalls(st.db, a.store, a.sessionID)
+	return a.completeCall(ctx, st, c, CallDone, result)
 }
 
 func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
 	now := time.Now()
 	c := RPCCall{
 		ID: newID("call"), SessionID: a.sessionID, MessageID: m.ID, ToolCallID: tc.ID, Index: i,
-		Method: tc.Function.Name, Status: CallQueued, CreatedAt: now, UpdatedAt: now,
+		Method: tc.Function.Name, Status: CallQueued, ResultMessageID: newID("msg"), CreatedAt: now, UpdatedAt: now,
 	}
 	fallbackID, _ := marshalJSON(tc.ID)
 	if tc.Function.Name != a.cfg.ToolName {
@@ -581,74 +713,115 @@ func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
 	return c
 }
 
-// cancelCalls closes not-yet-executed calls with a cancellation error and, if
-// nothing awaits confirmation, writes their tool messages.
-func (a *Agent) cancelCalls(ctx context.Context, st *runState, open []RPCCall, reason string) error {
-	if len(open) == 0 {
-		return nil
+// toolMessage builds the tool message mirroring a call's current state.
+func (a *Agent) toolMessage(c *RPCCall) Message {
+	status, content := MessagePending, ""
+	if c.Status == CallRunning {
+		status = MessageRunning
 	}
-	waiting := false
-	for i := range open {
-		c := &open[i]
-		switch c.Status {
-		case CallQueued, CallApproved:
-			c.Status = CallCancelled
-			c.Result = rpcErrorResponse(c.RPCID, &RPCError{Code: CodeCancelled, Message: reason})
-			if err := updateCall(st.db, a.store, c); err != nil {
-				return err
-			}
-		case CallAwaitingConfirmation:
-			waiting = true
-		}
+	if c.Status.finished() {
+		status, content = MessageDone, string(c.Result)
 	}
-	if waiting {
-		return nil
-	}
-	return a.flushResults(ctx, st, open)
+	return newMessage(a.sessionID, toolMessageRaw(c.ToolCallID, content), status)
 }
 
-// flushResults writes one tool message per call, in the model's call order.
-func (a *Agent) flushResults(ctx context.Context, st *runState, calls []RPCCall) error {
-	for i := range calls {
-		c := &calls[i]
-		raw, err := marshalJSON(struct {
-			Role       string `json:"role"`
-			ToolCallID string `json:"tool_call_id"`
-			Content    string `json:"content"`
-		}{"tool", c.ToolCallID, string(c.Result)})
-		if err != nil {
-			return err
+// createCall writes a call record and its tool message.
+func (a *Agent) createCall(ctx context.Context, st *runState, c *RPCCall) error {
+	if err := insertCall(st.db, a.store, c); err != nil {
+		return err
+	}
+	m := a.toolMessage(c)
+	m.ID = c.ResultMessageID
+	return a.insertMessage(ctx, st, &m)
+}
+
+func (a *Agent) completeCall(ctx context.Context, st *runState, c *RPCCall, status CallStatus, result json.RawMessage) error {
+	if err := completeCall(st.db, a.store, c, status, result); err != nil {
+		return err
+	}
+	a.notify(ctx, st, c.ResultMessageID)
+	return nil
+}
+
+// cancelCalls closes calls that never started with a cancellation error.
+func (a *Agent) cancelCalls(ctx context.Context, st *runState, open []RPCCall, reason string) error {
+	for i := range open {
+		c := &open[i]
+		if c.Status != CallQueued && c.Status != CallApproved {
+			continue
 		}
-		m, err := a.appendMessage(ctx, st, raw)
-		if err != nil {
-			return err
-		}
-		c.ResultMessageID = m.ID
-		if err := updateCall(st.db, a.store, c); err != nil {
+		if err := a.completeCall(ctx, st, c, CallCancelled, rpcErrorResponse(c.RPCID, &RPCError{Code: CodeCancelled, Message: reason})); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (a *Agent) appendMessage(ctx context.Context, st *runState, raw json.RawMessage) (Message, error) {
-	m, err := insertMessage(st.db, a.store, a.sessionID, raw)
-	if err != nil {
-		return m, err
+func (a *Agent) insertMessage(ctx context.Context, st *runState, m *Message) error {
+	if err := insertMessage(st.db, a.store, m); err != nil {
+		return err
 	}
-	st.res.Messages = append(st.res.Messages, m)
 	if a.cfg.OnMessage != nil {
-		a.cfg.OnMessage(ctx, m)
+		a.cfg.OnMessage(ctx, *m)
 	}
-	return m, nil
+	return nil
 }
 
-// step performs one LLM call and records its message and usage.
+func (a *Agent) updateMessage(ctx context.Context, st *runState, m *Message) error {
+	if err := updateMessage(st.db, a.store, m); err != nil {
+		return err
+	}
+	if a.cfg.OnMessage != nil {
+		a.cfg.OnMessage(ctx, *m)
+	}
+	return nil
+}
+
+// notify reloads a message changed in the store and passes it to OnMessage.
+func (a *Agent) notify(ctx context.Context, st *runState, messageID string) {
+	if a.cfg.OnMessage == nil {
+		return
+	}
+	if m, err := GetMessage(st.db, a.store, a.sessionID, messageID); err == nil {
+		a.cfg.OnMessage(ctx, *m)
+	}
+}
+
+// assistantRaw builds the assistant message stored and replayed to the model.
+func (a *Agent) assistantRaw(content, reasoning string, calls []ToolCall) json.RawMessage {
+	msg := struct {
+		Role             string     `json:"role"`
+		Content          *string    `json:"content"`
+		ReasoningContent string     `json:"reasoning_content,omitempty"`
+		ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	}{Role: "assistant", ToolCalls: calls}
+	if content != "" || len(calls) == 0 {
+		msg.Content = &content
+	}
+	if a.cfg.KeepReasoning {
+		msg.ReasoningContent = reasoning
+	}
+	for i := range msg.ToolCalls {
+		if msg.ToolCalls[i].Type == "" {
+			msg.ToolCalls[i].Type = "function"
+		}
+		if strings.TrimSpace(msg.ToolCalls[i].Function.Arguments) == "" {
+			msg.ToolCalls[i].Function.Arguments = "{}"
+		}
+	}
+	raw, _ := marshalJSON(msg)
+	return raw
+}
+
+// step performs one streamed LLM call. The assistant message is created on
+// the first delta, flushed every StreamFlushInterval, and finalised when the
+// stream ends (or marked interrupted if it breaks).
 func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	history, err := allMessages(st.db, a.store, a.sessionID)
 	if err != nil {
 		return false, err
 	}
+	history = replayable(history)
 	maxTokens, err := a.maxTokens(st, history)
 	if err != nil {
 		return false, err
@@ -667,26 +840,68 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 		req.MaxTokens = maxTokens
 	}
 
+	var (
+		msg                *Message
+		content, reasoning strings.Builder
+		lastFlush          time.Time
+	)
+	flush := func(status MessageStatus, raw json.RawMessage) error {
+		lastFlush = time.Now()
+		if msg == nil {
+			m := newMessage(a.sessionID, raw, status)
+			m.Reasoning = reasoning.String()
+			msg = &m
+			return a.insertMessage(ctx, st, msg)
+		}
+		msg.Raw, msg.Status, msg.Reasoning = raw, status, reasoning.String()
+		return a.updateMessage(ctx, st, msg)
+	}
+	partial := func() json.RawMessage { return a.assistantRaw(content.String(), "", nil) }
+	onDelta := func(dc, dr string) error {
+		content.WriteString(dc)
+		reasoning.WriteString(dr)
+		if msg == nil || time.Since(lastFlush) >= a.cfg.StreamFlushInterval {
+			if err := flush(MessageStreaming, partial()); err != nil {
+				return err
+			}
+		}
+		if a.cfg.OnStream != nil {
+			a.cfg.OnStream(ctx, msg.ID, dc, dr)
+		}
+		return nil
+	}
+
 	start := time.Now()
-	resp, err := a.llm.complete(ctx, req, a.cfg.ExtraBody)
+	res, err := a.llm.stream(ctx, req, a.cfg.ExtraBody, onDelta)
 	if err != nil {
+		if msg != nil {
+			// Keep what was generated; partial tool calls are dropped.
+			if ferr := flush(MessageInterrupted, partial()); ferr != nil {
+				err = errors.Join(err, ferr)
+			}
+		}
 		return false, err
 	}
 	latency := time.Since(start).Milliseconds()
-	choice := resp.Choices[0]
-
-	m, err := a.appendMessage(ctx, st, choice.Message)
-	if err != nil {
+	if err := a.ownsLock(st); err != nil {
+		return false, err // recovered while streaming; leave the message interrupted
+	}
+	content.Reset()
+	content.WriteString(res.Content)
+	reasoning.Reset()
+	reasoning.WriteString(res.Reasoning)
+	if err := flush(MessageDone, a.assistantRaw(res.Content, res.Reasoning, res.ToolCalls)); err != nil {
 		return false, err
 	}
-	usage := parseUsage(resp.Usage)
+
+	usage := parseUsage(res.Usage)
 	var cost Cost
 	if a.cfg.Billing != nil {
 		cost = a.cfg.Billing.Cost(a.cfg.Model, usage)
 	}
 	rec := UsageRecord{
-		ID: newID("llm"), SessionID: a.sessionID, MessageID: m.ID, Model: a.cfg.Model,
-		ResponseID: resp.ID, FinishReason: choice.FinishReason, Usage: usage, RawUsage: resp.Usage,
+		ID: newID("llm"), SessionID: a.sessionID, MessageID: msg.ID, Model: a.cfg.Model,
+		ResponseID: res.ID, FinishReason: res.FinishReason, Usage: usage, RawUsage: res.Usage,
 		Cost: cost, LatencyMs: latency, CreatedAt: time.Now(),
 	}
 	if err := insertUsage(st.db, a.store, &rec); err != nil {
@@ -694,17 +909,32 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	}
 	st.res.Usage.add(usage)
 	st.res.Cost.add(cost)
-	st.res.FinishReason = choice.FinishReason
+	st.res.FinishReason = res.FinishReason
 	if a.cfg.OnUsage != nil {
 		a.cfg.OnUsage(ctx, rec)
 	}
-	for i, tc := range m.ToolCalls {
-		c := a.newCall(&m, i, tc)
-		if err := insertCall(st.db, a.store, &c); err != nil {
+	for i, tc := range msg.ToolCalls {
+		c := a.newCall(msg, i, tc)
+		if err := a.createCall(ctx, st, &c); err != nil {
 			return false, err
 		}
 	}
-	return len(m.ToolCalls) > 0, nil
+	return len(msg.ToolCalls) > 0, nil
+}
+
+// replayable drops messages that must not be sent to the model: interrupted
+// assistant messages with no text, and anything not final.
+func replayable(ms []Message) []Message {
+	out := ms[:0:0]
+	for _, m := range ms {
+		switch {
+		case m.Status == MessageInterrupted && m.Content == "":
+		case !m.Status.Final():
+		default:
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // maxTokens estimates the prompt size (exact token count of the previous

@@ -5,7 +5,9 @@
 - 模型只有**一个工具**：JSON-RPC 2.0 调用（`method` / `params` / `id`）。你注册的 Go 方法都通过它被调用，SDK 负责路由、参数错误回传、panic 兜底。
 - 会话、消息、RPC 调用、每次 LLM 调用的全部 token 字段和积分都持久化到**抽象的 SQL 存储层**，通过 session id 随时恢复对话。
 - 消息按原始 JSON 字节完整保存并原样回放，保证大模型**前缀缓存**不丢失。
+- **流式输出**：助手消息边生成边写库（默认每 2 秒刷新一次，可配置），前端轮询数据库即可拿到实时内容。
 - 支持需要人工确认的 RPC 方法、Stop / Continue、跨进程的会话锁。
+- **崩溃恢复**：进程挂掉后，`Init` 会把卡住的会话、写了一半的消息、执行中的工具调用恢复成一致状态，可以直接继续对话。
 
 ## 安装
 
@@ -150,11 +152,11 @@ OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=sk-... MODEL=gpt-4o-min
 ### 全局初始化与会话
 
 ```go
-agent.Init(ctx, store)                                  // 建表，幂等
+agent.Init(ctx, store)                                  // 建表 + 崩溃恢复，幂等，启动时调用
 agent.SchemaStatements(agent.Postgres)                  // 只要 DDL，交给自己的迁移工具
 sid, _ := agent.CreateSession(ctx, store, metadata)     // 创建会话，返回 session id
 s, _ := agent.GetSession(ctx, store, sid)               // 会话状态、last_error、metadata
-agent.ResetSession(ctx, store, sid)                     // 进程崩溃后强制释放 running 状态
+agent.ResetSession(ctx, store, sid)                     // 手动恢复单个会话（见“异常恢复”）
 ```
 
 `agent.New` 的 `Config.SessionID` 为空时会自动创建新会话，用 `a.SessionID()` 取回。
@@ -176,12 +178,12 @@ agent.ResetSession(ctx, store, sid)                     // 进程崩溃后强制
 
 - `completed`：模型给出不含工具调用的回复
 - `waiting_confirmation`：有 `RequireConfirm` 的方法等待确认（同一轮中不需要确认的调用已先执行）
-- `stopped`：调用了 `Stop`，尚未执行的调用会以 `-32002 cancelled` 结果回填给模型，保证历史合法
+- `stopped`：调用了 `Stop`。正在流式输出的消息保留已生成部分（`interrupted`），尚未执行的调用以 `-32002 cancelled` 结果回填，保证历史合法
 - `max_steps`：达到 `Config.MaxSteps`（默认 50 次 LLM 调用）
 
-`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
+`Chat` 会阻塞到本次运行结束，Web 服务里一般放到 goroutine 中执行，前端轮询数据库获取进度（见“流式输出与前端轮询”）。`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
 
-**状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行中每一步都会心跳，进程崩溃后超过 `Config.StaleAfter`（默认 15 分钟）其他运行可接管，也可以直接 `agent.ResetSession`。
+**状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行期间后台每几秒心跳一次（流式输出和长时间的 RPC 调用中也会），超过 `Config.StaleAfter`（默认 1 分钟）没有心跳的会话可被其他运行接管。进程重启时由 `Init` 统一恢复，见“异常恢复”。
 
 典型 Web 服务用法：一个请求里 `go a.Chat(...)`，另一个请求用同一个 session id `agent.New(...)` 后调 `Stop` / `Status` / `PendingCalls` / `Confirm`。
 
@@ -278,7 +280,8 @@ Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 | `agent.InvalidParams(...)` / `Bind` 失败 / `Validate` 失败 | `-32602` |
 | handler 返回普通 error 或 panic | `-32603`，message 为错误内容 |
 | 用户拒绝确认 | `-32001` |
-| 运行被 Stop 而未执行 | `-32002` |
+| 运行被 Stop / 进程重启而未执行 | `-32002` |
+| 执行过程中进程崩溃（可能已生效，也可能没有） | `-32003` |
 | 自定义 | `agent.NewRPCError(code, msg, data)` |
 
 所有这些错误都只回给模型，不会中断 agent loop，模型可以自行修正后重试。
@@ -296,7 +299,70 @@ agent.MessagesAfter(ctx, store, sid, msgID, 20)      // msgID 之后的 20 条
 // Agent 上也有同名便捷方法：a.LatestMessages(ctx, 20) ...
 ```
 
-`Message` 字段：`ID`、`Seq`（会话内递增序号）、`Role`、`Content`（提取出的文本）、`ToolCalls`、`ToolCallID`、`Raw`（完整原始 JSON）、`CreatedAt`。
+`Message` 字段：`ID`、`Seq`（会话内递增序号）、`Role`、`Status`、`Content`（提取出的文本）、`Reasoning`（思考过程文本）、`ToolCalls`、`ToolCallID`、`Raw`（完整原始 JSON）、`CreatedAt`、`UpdatedAt`。另有 `agent.GetMessage(ctx, store, sid, msgID)` 查单条。
+
+### 流式输出与前端轮询
+
+SDK 始终以流式（SSE）调用大模型。前端不需要连接 SDK，只要**轮询数据库**：
+
+- 助手消息在收到第一个片段时就插入数据库（`status = streaming`），之后每隔 `Config.StreamFlushInterval`（默认 2 秒）更新一次内容，流结束时再写最终版本（`done`）。
+- 模型一返回工具调用，就为每个调用插入一条 tool 消息（`pending`）；开始执行前改成 `running`，执行完写入结果（`done`）。顺序和模型给出的 `tool_calls` 一致。
+
+| `Message.Status` | 含义 | 还会变吗 |
+| --- | --- | --- |
+| `streaming` | 助手消息生成中 | 会 |
+| `pending` | 工具调用排队中 / 等待确认 | 会 |
+| `running` | 工具调用执行中 | 会 |
+| `done` | 已完成 | 不会 |
+| `interrupted` | 助手输出被 Stop / 报错 / 崩溃打断，保留已生成的部分 | 不会 |
+
+用 `m.Status.Final()` 判断消息是否定稿。推荐的前端轮询方式：**游标只推进到最后一条已定稿的消息**，这样还在变化的消息每次都会被重新拉到：
+
+```go
+cursor := "" // 最后一条已定稿消息的 ID
+for {
+	var ms []agent.Message
+	if cursor == "" {
+		ms, _ = agent.LatestMessages(ctx, store, sid, 5)
+	} else {
+		ms, _ = agent.MessagesAfter(ctx, store, sid, cursor, 50)
+	}
+	render(ms) // 按 ID 覆盖渲染
+	for _, m := range ms {
+		if !m.Status.Final() {
+			break
+		}
+		cursor = m.ID
+	}
+	s, _ := agent.GetSession(ctx, store, sid)
+	if s.Status != agent.StatusRunning { /* 空闲或等待确认 */ }
+	time.Sleep(time.Second)
+}
+```
+
+同一进程内也可以用 `Config.OnStream`（每个文本片段）和 `Config.OnMessage`（每次写库）回调。
+
+### 异常恢复
+
+`agent.Init` 启动时会恢复上次进程留下的会话（状态为 `running` 的会话）：
+
+| 崩溃时所处阶段 | 恢复后 |
+| --- | --- |
+| 会话状态 `running` | 改为 `idle`；如果还有等待确认的调用则为 `waiting_confirmation`。`last_error` 记录恢复原因 |
+| 大模型流式输出中 | 助手消息改为 `interrupted`，保留已写入的部分内容（最多丢失最后一个刷新间隔的内容），可以直接继续对话 |
+| 工具调用执行中（`running`） | 调用标记为 `failed`，tool 消息写入 `-32003` 错误：“系统崩溃，调用可能已生效也可能没有” |
+| 工具调用已排队但还没开始 | 标记为 `cancelled`，写入 `-32002` 错误 |
+| 等待确认的调用 | 保留，恢复后仍可 `Confirm` |
+
+恢复后历史是完整合法的，直接 `Chat` / `Continue` 即可，模型能看到哪些调用失败了。被打断的助手消息如果一个字都没有，不会发给模型。
+
+**多实例部署**：默认 `Init` 会恢复**所有** `running` 的会话，适合单实例。多个进程共用一个数据库时，要只恢复真正没有心跳的会话，避免重启一个实例时误伤其他实例正在跑的会话：
+
+```go
+agent.Init(ctx, store, agent.RecoverStaleAfter(2*time.Minute)) // 需大于 Config.StaleAfter
+```
+
+另外，每次运行开始时也会自动修复该会话的残留状态（接管无心跳的会话时同样适用），所以即使没有重新调用 `Init`，也不会出现历史不完整的情况。
 
 ### Token 记录与计费
 
@@ -353,7 +419,7 @@ type Store interface {
 | 表 | 内容 |
 | --- | --- |
 | `agent_sessions` | 会话、状态、运行锁、last_error、metadata |
-| `agent_messages` | 消息，`(session_id, seq)` 唯一，`raw` 为完整原始 JSON |
+| `agent_messages` | 消息，`(session_id, seq)` 唯一，`raw` 为完整原始 JSON，`status` 为流式 / 执行状态 |
 | `agent_llm_calls` | 每次 LLM 调用的全部 token 字段、原始 usage、积分、延迟 |
 | `agent_rpc_calls` | 每次 RPC 调用：方法、参数、状态、确认、JSON-RPC 结果 |
 
@@ -361,13 +427,17 @@ type Store interface {
 
 | 字段 | 说明 |
 | --- | --- |
-| `ExtraBody` | 合并进请求体，如 `temperature`、`top_p`、`reasoning_effort` |
+| `StreamFlushInterval` | 流式输出时写库的间隔，默认 2 秒 |
+| `StreamIdleTimeout` | 流式输出多久没有数据就中断，默认 2 分钟，负数关闭 |
+| `KeepReasoning` | 把思考内容以 `reasoning_content` 回传给模型（DeepSeek 思考模式 + 工具调用需要）。无论开不开，思考内容都会存进 `Message.Reasoning` |
+| `ExtraBody` | 合并进请求体，如 `temperature`、`top_p`、`reasoning_effort`；值为 `nil` 表示删除默认字段，例如不支持 `stream_options` 的服务可设 `"stream_options": nil` |
 | `UseMaxCompletionTokens` | 用 `max_completion_tokens` 代替 `max_tokens`（新版 OpenAI 推理模型） |
-| `Headers` / `HTTPClient` | 自定义请求头 / HTTP 客户端 |
-| `MaxRetries` | 429 / 5xx / 网络错误重试次数，默认 2，负数关闭 |
+| `Headers` / `HTTPClient` | 自定义请求头 / HTTP 客户端（默认不设整体超时，由 `StreamIdleTimeout` 兜底） |
+| `MaxRetries` | 429 / 5xx / 网络错误重试次数，默认 2，负数关闭；已经开始输出后不再重试 |
 | `MaxSteps` | 单次运行最多 LLM 调用次数，默认 50 |
-| `StaleAfter` | 运行锁心跳超时，默认 15 分钟 |
-| `OnMessage` | 每条消息落库后回调，可用于推送给前端 |
+| `StaleAfter` | 运行锁心跳超时，默认 1 分钟 |
+| `OnStream` | 每个流式文本片段的回调 |
+| `OnMessage` | 每次消息写库（插入、流式刷新、工具状态变化）后回调 |
 | `OnUsage` | 每次 LLM 调用记账后回调 |
 
 ## 开发

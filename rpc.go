@@ -20,6 +20,7 @@ const (
 	CodeInternalError  = -32603
 	CodeRejected       = -32001 // the user rejected a call that required confirmation
 	CodeCancelled      = -32002 // the run was stopped before the call executed
+	CodeCrashed        = -32003 // the process crashed while the call was running
 )
 
 // Handler executes one RPC method. The returned value is JSON-encoded into the

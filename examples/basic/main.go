@@ -59,6 +59,11 @@ func main() {
 		ContextParams:   map[string]any{"user_id": "u_42"},
 		Store:           store,
 		Billing:         agent.Pricing{Input: 100, Output: 1000, CacheRead: 10},
+		// Print tokens as they stream in. A web frontend would instead poll
+		// agent.MessagesAfter(cursor), which is refreshed every StreamFlushInterval.
+		OnStream: func(ctx context.Context, messageID, content, reasoning string) {
+			fmt.Print(content)
+		},
 		Methods: []agent.Method{
 			agent.NewMethod("get_order", func(ctx context.Context, c *agent.Call, p getOrderParams) (any, error) {
 				return map[string]any{"order_id": p.OrderID, "owner": c.Value("user_id"), "status": "delivered", "total": 59.9}, nil
@@ -101,7 +106,7 @@ func main() {
 			log.Println("error:", err)
 			continue
 		}
-		fmt.Println(res.Reply())
+		fmt.Println()
 		fmt.Printf("[tokens in=%d cached=%d out=%d, credits=%.4f]\n",
 			res.Usage.PromptTokens, res.Usage.CachedTokens, res.Usage.CompletionTokens, res.Cost.Total)
 	}

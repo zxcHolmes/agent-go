@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"strings"
 )
@@ -15,7 +14,8 @@ type tableDef struct {
 func tableDefs(text string) []tableDef {
 	return []tableDef{
 		{
-			name: "agent_sessions",
+			name:    "agent_sessions",
+			indexes: [][2]string{{"idx_agent_sessions_status", "status, updated_at"}},
 			columns: []string{
 				"id VARCHAR(64) NOT NULL PRIMARY KEY",
 				"status VARCHAR(32) NOT NULL",
@@ -34,10 +34,13 @@ func tableDefs(text string) []tableDef {
 				"session_id VARCHAR(64) NOT NULL",
 				"seq BIGINT NOT NULL",
 				"role VARCHAR(32) NOT NULL",
+				"status VARCHAR(32) NOT NULL",
 				"content " + text + " NOT NULL",
+				"reasoning " + text + " NOT NULL",
 				"tool_call_id VARCHAR(255) NOT NULL",
 				"raw " + text + " NOT NULL",
 				"created_at BIGINT NOT NULL",
+				"updated_at BIGINT NOT NULL",
 				"UNIQUE (session_id, seq)",
 			},
 		},
@@ -90,7 +93,7 @@ func tableDefs(text string) []tableDef {
 				"updated_at BIGINT NOT NULL",
 			},
 			indexes: [][2]string{
-				{"idx_agent_rpc_calls_open", "session_id, result_message_id"},
+				{"idx_agent_rpc_calls_status", "session_id, status"},
 				{"idx_agent_rpc_calls_message", "message_id"},
 			},
 		},
@@ -125,15 +128,4 @@ func SchemaStatements(d Dialect) []string {
 		}
 	}
 	return stmts
-}
-
-// Init creates the SDK tables if they do not exist. Call it once at startup;
-// it is idempotent.
-func Init(ctx context.Context, store Store) error {
-	for _, stmt := range SchemaStatements(store.Dialect()) {
-		if _, err := store.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("agent: init schema: %w", err)
-		}
-	}
-	return nil
 }

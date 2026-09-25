@@ -115,12 +115,17 @@ func TestRebindAndSchema(t *testing.T) {
 }
 
 func TestBuildBodyExtra(t *testing.T) {
-	b, err := buildBody(chatRequest{Model: "m", Messages: []json.RawMessage{json.RawMessage(`{"role":"user","content":"<a&b>"}`)}},
-		map[string]any{"temperature": 0.2, "model": "hijack"})
+	req := chatRequest{Model: "m", Messages: []json.RawMessage{json.RawMessage(`{"role":"user","content":"<a&b>"}`)},
+		Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}}
+	b, err := buildBody(req, map[string]any{"temperature": 0.2, "model": "hijack", "stream": false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(b) != `{"messages":[{"role":"user","content":"<a&b>"}],"model":"m","temperature":0.2}` {
+	if string(b) != `{"messages":[{"role":"user","content":"<a&b>"}],"model":"m","stream":true,"stream_options":{"include_usage":true},"temperature":0.2}` {
 		t.Fatalf("got %s", b)
+	}
+	b, _ = buildBody(req, map[string]any{"stream_options": nil})
+	if strings.Contains(string(b), "stream_options") {
+		t.Fatalf("nil should remove the field: %s", b)
 	}
 }

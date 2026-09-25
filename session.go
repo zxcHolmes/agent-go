@@ -77,39 +77,23 @@ func GetSession(ctx context.Context, store Store, id string) (*Session, error) {
 	return &s, nil
 }
 
-// ResetSession forcibly releases a session left "running" by a crashed
-// process. Only use it when you know no run is active. Calls still awaiting
-// confirmation keep the session in StatusWaitingConfirmation.
-func ResetSession(ctx context.Context, store Store, id string) error {
-	pending, err := PendingCalls(ctx, store, id)
-	if err != nil {
-		return err
-	}
-	status := StatusIdle
-	if len(pending) > 0 {
-		status = StatusWaitingConfirmation
-	}
-	_, err = store.Exec(ctx, "UPDATE agent_sessions SET status = ?, run_id = '', stop_requested = 0, updated_at = ? WHERE id = ?",
-		string(status), nowMillis(), id)
-	return err
-}
-
 // ---- messages ----
 
-const messageCols = "id, session_id, seq, role, content, tool_call_id, raw, created_at"
+const messageCols = "id, session_id, seq, role, status, content, reasoning, tool_call_id, raw, created_at, updated_at"
 
 func scanMessages(rows Rows) ([]Message, error) {
 	defer rows.Close()
 	var out []Message
 	for rows.Next() {
 		var m Message
-		var raw string
-		var created int64
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.Seq, &m.Role, &m.Content, &m.ToolCallID, &raw, &created); err != nil {
+		var raw, status string
+		var created, updated int64
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Seq, &m.Role, &status, &m.Content, &m.Reasoning, &m.ToolCallID, &raw, &created, &updated); err != nil {
 			return nil, err
 		}
+		m.Status = MessageStatus(status)
 		m.Raw = json.RawMessage(raw)
-		m.CreatedAt = fromMillis(created)
+		m.CreatedAt, m.UpdatedAt = fromMillis(created), fromMillis(updated)
 		m.ToolCalls = decodeMessage(m.Raw).ToolCalls
 		out = append(out, m)
 	}
@@ -159,11 +143,21 @@ func contentText(c json.RawMessage) string {
 	return string(c)
 }
 
-func insertMessage(ctx context.Context, store Store, sessionID string, raw json.RawMessage) (Message, error) {
+// newMessage fills the decoded fields of a message from its raw JSON.
+func newMessage(sessionID string, raw json.RawMessage, status MessageStatus) Message {
 	d := decodeMessage(raw)
-	rows, err := store.Query(ctx, "SELECT COALESCE(MAX(seq), 0) FROM agent_messages WHERE session_id = ?", sessionID)
+	now := time.Now()
+	return Message{
+		ID: newID("msg"), SessionID: sessionID, Role: d.Role, Status: status, Content: d.Content,
+		ToolCalls: d.ToolCalls, ToolCallID: d.ToolCallID, Raw: raw, CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+// insertMessage assigns the next seq and stores m.
+func insertMessage(ctx context.Context, store Store, m *Message) error {
+	rows, err := store.Query(ctx, "SELECT COALESCE(MAX(seq), 0) FROM agent_messages WHERE session_id = ?", m.SessionID)
 	if err != nil {
-		return Message{}, err
+		return err
 	}
 	var seq int64
 	if rows.Next() {
@@ -171,26 +165,47 @@ func insertMessage(ctx context.Context, store Store, sessionID string, raw json.
 	}
 	rows.Close()
 	if err != nil {
-		return Message{}, err
+		return err
 	}
-	m := Message{
-		ID:         newID("msg"),
-		SessionID:  sessionID,
-		Seq:        seq + 1,
-		Role:       d.Role,
-		Content:    d.Content,
-		ToolCalls:  d.ToolCalls,
-		ToolCallID: d.ToolCallID,
-		Raw:        raw,
-		CreatedAt:  time.Now(),
-	}
+	m.Seq = seq + 1
 	_, err = store.Exec(ctx,
-		"INSERT INTO agent_messages ("+messageCols+") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		m.ID, m.SessionID, m.Seq, m.Role, m.Content, m.ToolCallID, string(m.Raw), m.CreatedAt.UnixMilli())
+		"INSERT INTO agent_messages ("+messageCols+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		m.ID, m.SessionID, m.Seq, m.Role, string(m.Status), m.Content, m.Reasoning, m.ToolCallID, string(m.Raw),
+		m.CreatedAt.UnixMilli(), m.UpdatedAt.UnixMilli())
 	if err != nil {
-		return Message{}, fmt.Errorf("agent: insert message: %w", err)
+		return fmt.Errorf("agent: insert message: %w", err)
 	}
-	return m, nil
+	return nil
+}
+
+// updateMessage rewrites the mutable parts of a message (while streaming or
+// while its tool call is in progress).
+func updateMessage(ctx context.Context, store Store, m *Message) error {
+	d := decodeMessage(m.Raw)
+	m.Content, m.ToolCalls = d.Content, d.ToolCalls
+	m.UpdatedAt = time.Now()
+	_, err := store.Exec(ctx, "UPDATE agent_messages SET status = ?, content = ?, reasoning = ?, raw = ?, updated_at = ? WHERE id = ?",
+		string(m.Status), m.Content, m.Reasoning, string(m.Raw), m.UpdatedAt.UnixMilli(), m.ID)
+	if err != nil {
+		return fmt.Errorf("agent: update message: %w", err)
+	}
+	return nil
+}
+
+// GetMessage loads one message, e.g. to poll a message that is still streaming.
+func GetMessage(ctx context.Context, store Store, sessionID, messageID string) (*Message, error) {
+	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND id = ?", sessionID, messageID)
+	if err != nil {
+		return nil, err
+	}
+	ms, err := scanMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(ms) == 0 {
+		return nil, ErrMessageNotFound
+	}
+	return &ms[0], nil
 }
 
 func allMessages(ctx context.Context, store Store, sessionID string) ([]Message, error) {
@@ -201,12 +216,25 @@ func allMessages(ctx context.Context, store Store, sessionID string) ([]Message,
 	return scanMessages(rows)
 }
 
-func lastMessage(ctx context.Context, store Store, sessionID string) (*Message, error) {
-	ms, err := LatestMessages(ctx, store, sessionID, 1)
+// lastAssistant returns the newest assistant message, if any.
+func lastAssistant(ctx context.Context, store Store, sessionID string) (*Message, error) {
+	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND role = 'assistant' ORDER BY seq DESC LIMIT 1", sessionID)
+	if err != nil {
+		return nil, err
+	}
+	ms, err := scanMessages(rows)
 	if err != nil || len(ms) == 0 {
 		return nil, err
 	}
 	return &ms[0], nil
+}
+
+func messagesAfterSeq(ctx context.Context, store Store, sessionID string, seq int64) ([]Message, error) {
+	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND seq > ? ORDER BY seq ASC", sessionID, seq)
+	if err != nil {
+		return nil, err
+	}
+	return scanMessages(rows)
 }
 
 func normLimit(limit int) int {
@@ -331,13 +359,50 @@ func updateCall(ctx context.Context, store Store, c *RPCCall) error {
 	return nil
 }
 
-// openCalls returns calls whose tool result message has not been written yet.
+// openCalls returns calls that have not finished yet.
 func openCalls(ctx context.Context, store Store, sessionID string) ([]RPCCall, error) {
-	rows, err := store.Query(ctx, "SELECT "+callCols+" FROM agent_rpc_calls WHERE session_id = ? AND result_message_id = '' ORDER BY created_at ASC, call_index ASC", sessionID)
+	rows, err := store.Query(ctx, "SELECT "+callCols+" FROM agent_rpc_calls WHERE session_id = ? AND status IN (?, ?, ?, ?) ORDER BY created_at ASC, call_index ASC",
+		sessionID, string(CallQueued), string(CallAwaitingConfirmation), string(CallApproved), string(CallRunning))
 	if err != nil {
 		return nil, err
 	}
 	return scanCalls(rows)
+}
+
+func toolMessageRaw(toolCallID, content string) json.RawMessage {
+	raw, _ := marshalJSON(struct {
+		Role       string `json:"role"`
+		ToolCallID string `json:"tool_call_id"`
+		Content    string `json:"content"`
+	}{"tool", toolCallID, content})
+	return raw
+}
+
+// setCallStatus moves a call to a non-final status and mirrors it on its tool message.
+func setCallStatus(ctx context.Context, store Store, c *RPCCall, status CallStatus) error {
+	c.Status = status
+	if err := updateCall(ctx, store, c); err != nil {
+		return err
+	}
+	ms := MessagePending
+	if status == CallRunning {
+		ms = MessageRunning
+	}
+	_, err := store.Exec(ctx, "UPDATE agent_messages SET status = ?, updated_at = ? WHERE id = ?", string(ms), nowMillis(), c.ResultMessageID)
+	return err
+}
+
+// completeCall stores the final result of a call and writes it into its tool message.
+func completeCall(ctx context.Context, store Store, c *RPCCall, status CallStatus, result json.RawMessage) error {
+	c.Status, c.Result = status, result
+	if err := updateCall(ctx, store, c); err != nil {
+		return err
+	}
+	if c.ResultMessageID == "" {
+		return nil
+	}
+	m := Message{ID: c.ResultMessageID, Status: MessageDone, Raw: toolMessageRaw(c.ToolCallID, string(result))}
+	return updateMessage(ctx, store, &m)
 }
 
 func callsForMessage(ctx context.Context, store Store, messageID string) ([]RPCCall, error) {
