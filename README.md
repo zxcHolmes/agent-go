@@ -586,8 +586,6 @@ type Store interface {
 // Rows 与 *sql.Rows 一致：Next / Scan / Err / Close
 ```
 
-升级 SDK 后，`NewClient` 会自动为旧版本建好的表补上新增的列（`ALTER TABLE … ADD COLUMN`），不需要手动迁移。
-
 表结构（前缀 `agent_`，时间统一为毫秒时间戳 BIGINT）：
 
 | 表 | 内容 |
