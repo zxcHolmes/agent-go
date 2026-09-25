@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -208,7 +209,15 @@ func (c *llmClient) doStream(parent context.Context, body []byte, onDelta deltaF
 				}
 			}
 			if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
-				return nil, false, &APIError{StatusCode: httpResp.StatusCode, Body: truncate(string(chunk.Error), 2000)}
+				// Proxies report upstream failures inside a 200 stream; honour
+				// the embedded code so transient ones are retried.
+				code := errorCode(chunk.Error)
+				status := httpResp.StatusCode
+				if code >= 400 {
+					status = code
+				}
+				retry := !started && (code == http.StatusTooManyRequests || code >= 500)
+				return nil, retry, &APIError{StatusCode: status, Body: truncate(string(chunk.Error), 2000)}
 			}
 			content, reasoning := acc.add(&chunk)
 			if content != "" || reasoning != "" || len(chunk.Choices) > 0 {
@@ -352,4 +361,23 @@ func chatEndpoint(baseURL string) string {
 		return u
 	}
 	return u + "/chat/completions"
+}
+
+// errorCode extracts a numeric "code" from an error object, if any.
+func errorCode(raw json.RawMessage) int {
+	var e struct {
+		Code json.RawMessage `json:"code"`
+	}
+	if json.Unmarshal(raw, &e) != nil {
+		return 0
+	}
+	var n int
+	if json.Unmarshal(e.Code, &n) == nil {
+		return n
+	}
+	var s string
+	if json.Unmarshal(e.Code, &s) == nil {
+		n, _ = strconv.Atoi(s)
+	}
+	return n
 }

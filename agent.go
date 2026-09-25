@@ -780,6 +780,12 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 		llmCalls++
 		hasCalls, err := a.step(ctx, st)
 		if err != nil {
+			if healed, herr := a.dropUnloadableImages(ctx, st, err); herr != nil {
+				return "", errors.Join(err, herr)
+			} else if healed {
+				llmCalls--
+				continue // retry without the images the provider could not load
+			}
 			return "", err
 		}
 		if !hasCalls {
@@ -1141,6 +1147,7 @@ func replayable(ms []Message) []Message {
 	for _, m := range ms {
 		switch {
 		case m.Status == MessageInterrupted && m.Content == "":
+		case m.Status == MessageExcluded:
 		case !m.Status.Final():
 		default:
 			out = append(out, m)

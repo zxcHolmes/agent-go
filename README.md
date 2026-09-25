@@ -366,6 +366,7 @@ user       [{"type":"text","text":"[view_image result for call_x] https://cdn.ex
 - 这条 user 消息的 `Message.Kind` 为 `"view_image"`，`ToolCallID` 指向对应的工具调用。前端可以据此把它渲染成附件，而不是用户说的话。
 - 只接受 `http` / `https` 的 URL。其他地址（`file://`、`data:` 等）会以 `{"ok":false,"error":...}` 返回给模型，不会生成图片消息。
 - 进程崩溃时如果图片消息还没写入，下次运行开始时会自动补上，不会重复。
+- **图片加载失败不会卡死会话**：服务商拉取不到图片时（URL 404、防盗链等），会以 400 拒绝整个请求。如果不处理，这条图片消息每次都会被重放，会话就永久失败了。SDK 检测到这种情况时，会把本轮还没成功发送的图片消息标记为 `excluded`（前端仍可展示，但不再发给模型），把对应的工具结果改写为 `{"ok":false,"error":"...could not load this image..."}`，然后自动重试。模型会知道图片打不开，对话照常继续。
 
 ### 上下文参数（身份验证）
 
@@ -396,6 +397,7 @@ SDK 始终以流式（SSE）调用大模型。前端不需要连接 SDK，只要
 | `running` | 工具调用执行中 | 会 |
 | `done` | 已完成 | 不会 |
 | `interrupted` | 助手输出被 Stop / 报错 / 崩溃打断，保留已生成的部分 | 不会 |
+| `excluded` | 保留用于展示，但不再发给模型（例如服务商无法加载的 `view_image` 图片） | 不会 |
 
 用 `m.Status.Final()` 判断消息是否定稿。推荐的前端轮询方式：**游标只推进到最后一条已定稿的消息**，这样还在变化的消息每次都会被重新拉到：
 
@@ -553,7 +555,7 @@ type Store interface {
 | `ExtraBody` | 合并进请求体，如 `temperature`、`top_p`、`reasoning_effort`；值为 `nil` 表示删除默认字段，例如不支持 `stream_options` 的服务可设 `"stream_options": nil` |
 | `UseMaxCompletionTokens` | 用 `max_completion_tokens` 代替 `max_tokens`（新版 OpenAI 推理模型） |
 | `Headers` / `HTTPClient` | 自定义请求头 / HTTP 客户端（默认不设整体超时，由 `StreamIdleTimeout` 兜底） |
-| `MaxRetries` | 429 / 5xx / 网络错误重试次数，默认 2，负数关闭；已经开始输出后不再重试 |
+| `MaxRetries` | 429 / 5xx / 网络错误重试次数，默认 2，负数关闭；已经开始输出后不再重试。代理在 HTTP 200 的流里返回的错误（如 `{"error":{"code":502}}`）也按其中的 code 判断是否重试 |
 | `MaxSteps` | 单次运行最多 LLM 调用次数，默认 50 |
 | `StaleAfter` | 运行锁心跳超时，默认 1 分钟 |
 | `OnStream` | 每个流式文本片段的回调 |

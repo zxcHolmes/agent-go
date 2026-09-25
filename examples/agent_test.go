@@ -26,6 +26,9 @@ type reply struct {
 	msg       string        // assistant message JSON
 	delay     time.Duration // pause between content chunks
 	hangAfter int           // hang after this many content chunks (-1 = never)
+	httpErr   int           // respond with this HTTP status and body instead
+	streamErr string        // send this error object inside a 200 stream instead
+	body      string
 }
 
 // fakeLLM is a scripted, streaming OpenAI-compatible server.
@@ -50,6 +53,15 @@ func (f *fakeLLM) handler(w http.ResponseWriter, r *http.Request) {
 	rp := f.replies[0]
 	f.replies = f.replies[1:]
 	f.mu.Unlock()
+	if rp.httpErr != 0 {
+		http.Error(w, rp.body, rp.httpErr)
+		return
+	}
+	if rp.streamErr != "" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"error\":%s}\n\n", rp.streamErr)
+		return
+	}
 
 	var m struct {
 		Content   *string          `json:"content"`
@@ -985,6 +997,57 @@ func TestViewImage(t *testing.T) {
 	}
 	if !strings.Contains(string(msgs[len(msgs)-2]), `"tool_call_id":"t3"`) {
 		t.Fatal("image must come after every tool result")
+	}
+}
+
+// Seen live: a proxy reported an upstream 502 inside an HTTP 200 stream.
+func TestInStreamTransientErrorIsRetried(t *testing.T) {
+	e := setup(t)
+	e.cfg.MaxRetries = 2
+	a := e.newAgent(t, "")
+	e.llm.pushReply(reply{streamErr: `{"code":502,"message":"Flex processing is temporarily unavailable"}`})
+	e.llm.push(text("ok"))
+	res, err := a.Chat(context.Background(), "hi")
+	if err != nil || res.Reply() != "ok" || len(e.llm.requests) != 2 {
+		t.Fatalf("%v %v requests=%d", res, err, len(e.llm.requests))
+	}
+	// A non-transient in-stream error is not retried.
+	e.llm.pushReply(reply{streamErr: `{"code":400,"message":"bad request"}`})
+	var ae *agent.APIError
+	if _, err := a.Chat(context.Background(), "again"); !errors.As(err, &ae) || ae.StatusCode != 400 {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Seen live: the provider could not download the image URL and rejected the
+// request; without healing, every later request replays the image and fails.
+func TestUnloadableImageDoesNotPoisonSession(t *testing.T) {
+	e := setup(t)
+	e.cfg.ViewImage = true
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	args, _ := json.Marshal(`{"url":"https://example.com/missing.png"}`)
+	e.llm.push(fmt.Sprintf(`{"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"view_image","arguments":%s}}]}`, args))
+	e.llm.pushReply(reply{httpErr: 400, body: `{"error":{"message":"Error while downloading file. Upstream status code: 400.","param":"url"}}`})
+	e.llm.push(text("I could not load that image."))
+	res, err := a.Chat(ctx, "look at it")
+	if err != nil || res.Reply() != "I could not load that image." {
+		t.Fatal(res, err)
+	}
+	ms, _ := e.client.LatestMessages(ctx, a.SessionID(), 10)
+	if statuses(ms) != "done,done,done,excluded,done" || !strings.Contains(ms[2].Content, "could not load this image") {
+		t.Fatalf("%s %s", statuses(ms), ms[2].Content)
+	}
+	if strings.Contains(fmt.Sprint(e.llm.request(2)), "image_url") {
+		t.Fatal("excluded image was sent again")
+	}
+	// Later turns keep working.
+	e.llm.push(text("fine"))
+	if res, err := a.Chat(ctx, "ok?"); err != nil || res.Reply() != "fine" {
+		t.Fatal(res, err)
+	}
+	if strings.Contains(fmt.Sprint(e.llm.request(3)), "image_url") {
+		t.Fatal("excluded image was sent again")
 	}
 }
 

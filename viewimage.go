@@ -131,3 +131,56 @@ func (a *Agent) attachImages(ctx context.Context, st *runState, calls []RPCCall)
 	}
 	return nil
 }
+
+// dropUnloadableImages handles a provider that rejects a request because it
+// cannot fetch an image URL. Left alone, the image message would be replayed
+// on every later request and the session would fail forever. If err looks like
+// such a rejection and the current turn has image messages that have not been
+// accepted yet, they are marked excluded and their tool results rewritten to
+// an error the model can read; the caller then retries the step.
+func (a *Agent) dropUnloadableImages(ctx context.Context, st *runState, err error) (bool, error) {
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.StatusCode != 400 {
+		return false, nil
+	}
+	body := strings.ToLower(ae.Body)
+	if !strings.Contains(body, "image") && !strings.Contains(body, "url") &&
+		!strings.Contains(body, "download") && !strings.Contains(body, "fetch") {
+		return false, nil
+	}
+	last, lerr := lastAssistant(st.db, a.store, a.sessionID)
+	if lerr != nil || last == nil {
+		return false, lerr
+	}
+	after, lerr := messagesAfterSeq(st.db, a.store, a.sessionID, last.Seq)
+	if lerr != nil {
+		return false, lerr
+	}
+	calls, lerr := callsForMessage(st.db, a.store, last.ID)
+	if lerr != nil {
+		return false, lerr
+	}
+	healed := false
+	for i := range after {
+		m := &after[i]
+		if m.Kind != MessageKindViewImage || m.Status != MessageDone {
+			continue
+		}
+		m.Status = MessageExcluded
+		if err := a.updateMessage(ctx, st, m); err != nil {
+			return false, err
+		}
+		for j := range calls {
+			c := &calls[j]
+			if c.Method != ViewImageTool || c.ToolCallID != m.ToolCallID {
+				continue
+			}
+			result, _ := marshalJSON(map[string]any{"ok": false, "error": "view_image: the model provider could not load this image: " + truncate(ae.Body, 300)})
+			if err := a.completeCall(ctx, st, c, CallDone, result); err != nil {
+				return false, err
+			}
+		}
+		healed = true
+	}
+	return healed, nil
+}

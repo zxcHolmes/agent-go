@@ -61,6 +61,9 @@ const (
 	// MessageInterrupted: assistant output cut off by Stop, an error or a
 	// crash. Final; the partial content is kept in the history.
 	MessageInterrupted MessageStatus = "interrupted"
+	// MessageExcluded: kept for display but never sent to the model again,
+	// e.g. a view_image message whose URL the provider could not load.
+	MessageExcluded MessageStatus = "excluded"
 )
 
 // MessageKindViewImage marks the user message the SDK injects to show the
@@ -70,7 +73,9 @@ const (
 const MessageKindViewImage = "view_image"
 
 // Final reports whether the message will not change anymore.
-func (s MessageStatus) Final() bool { return s == MessageDone || s == MessageInterrupted }
+func (s MessageStatus) Final() bool {
+	return s == MessageDone || s == MessageInterrupted || s == MessageExcluded
+}
 
 // StopReason explains why a run returned.
 type StopReason string
