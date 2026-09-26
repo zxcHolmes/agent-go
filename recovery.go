@@ -70,7 +70,7 @@ func resetSession(ctx context.Context, store Store, id string) error {
 	if err != nil {
 		return err
 	}
-	if err := recoverSessionData(ctx, store, id); err != nil {
+	if err := recoverSessionData(ctx, store, lease{}, id); err != nil {
 		return err
 	}
 	pending, err := pendingCalls(ctx, store, id)
@@ -79,7 +79,7 @@ func resetSession(ctx context.Context, store Store, id string) error {
 	}
 	if s.Status == StatusStopping {
 		for i := range pending {
-			if err := completeCall(ctx, store, &pending[i], CallCancelled, rpcErrorResponse(pending[i].RPCID, errStoppedNotRun)); err != nil {
+			if err := completeCall(ctx, store, lease{}, &pending[i], CallCancelled, rpcErrorResponse(pending[i].RPCID, errStoppedNotRun)); err != nil {
 				return err
 			}
 		}
@@ -95,9 +95,10 @@ func resetSession(ctx context.Context, store Store, id string) error {
 }
 
 // recoverSessionData fixes messages and calls left mid-flight by a dead run.
-func recoverSessionData(ctx context.Context, store Store, sessionID string) error {
-	if _, err := store.Exec(ctx, "UPDATE agent_messages SET status = ?, updated_at = ? WHERE session_id = ? AND status = ?",
-		string(MessageInterrupted), nowMillis(), sessionID, string(MessageStreaming)); err != nil {
+func recoverSessionData(ctx context.Context, store Store, l lease, sessionID string) error {
+	q, args := l.fence("UPDATE agent_messages SET status = ?, updated_at = ? WHERE session_id = ? AND status = ?",
+		[]any{string(MessageInterrupted), nowMillis(), sessionID, string(MessageStreaming)})
+	if _, err := store.Exec(ctx, q, args...); err != nil {
 		return err
 	}
 	open, err := openCalls(ctx, store, sessionID)
@@ -108,12 +109,12 @@ func recoverSessionData(ctx context.Context, store Store, sessionID string) erro
 		c := &open[i]
 		switch c.Status {
 		case CallRunning:
-			err = completeCall(ctx, store, c, CallFailed, rpcErrorResponse(c.RPCID, &RPCError{
+			err = completeCall(ctx, store, l, c, CallFailed, rpcErrorResponse(c.RPCID, &RPCError{
 				Code:    CodeCrashed,
 				Message: "failed: the system crashed while this call was running; it may or may not have taken effect",
 			}))
 		case CallQueued, CallApproved:
-			err = completeCall(ctx, store, c, CallCancelled, rpcErrorResponse(c.RPCID, &RPCError{
+			err = completeCall(ctx, store, l, c, CallCancelled, rpcErrorResponse(c.RPCID, &RPCError{
 				Code:    CodeCancelled,
 				Message: "cancelled: the system restarted before this call ran",
 			}))

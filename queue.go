@@ -204,8 +204,9 @@ func (a *Agent) userMessage(raw json.RawMessage) (Message, error) {
 // it, so a crash in between never loses or duplicates one: rows left taken
 // by a crashed run are picked up here by the next one.
 func (a *Agent) drainQueue(ctx context.Context, st *runState) (int, error) {
-	if _, err := a.store.Exec(st.db, "UPDATE agent_queued_messages SET status = ? WHERE session_id = ? AND status = ?",
-		queueTaken, a.sessionID, queueWaiting); err != nil {
+	q, args := st.lease.fence("UPDATE agent_queued_messages SET status = ? WHERE session_id = ? AND status = ?",
+		[]any{queueTaken, a.sessionID, queueWaiting})
+	if _, err := a.store.Exec(st.db, q, args...); err != nil {
 		return 0, err
 	}
 	qs, err := queuedMessages(st.db, a.store, a.sessionID, queueTaken)

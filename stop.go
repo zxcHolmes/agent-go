@@ -11,8 +11,8 @@ import (
 // safe to call concurrently, from any process sharing the store.
 //
 //   - running: the session turns "stopping" and the run is interrupted (at
-//     once in this process, within Config.StopPollInterval in another). A
-//     streaming answer is cut off and keeps its partial text ("interrupted"),
+//     once if it belongs to this Client, otherwise within
+//     Config.StopPollInterval). A streaming answer is cut off and keeps its partial text ("interrupted"),
 //     the LLM request is cancelled, a running RPC call is abandoned without
 //     waiting for its handler (the handler's ctx is cancelled and its eventual
 //     result discarded), and every unfinished call, including calls awaiting
@@ -65,7 +65,7 @@ func (a *Agent) Stop(ctx context.Context) error {
 				string(StatusStopping), a.sessionID, string(StatusRunning)); err != nil {
 				return err
 			}
-			if v, ok := running.Load(a.sessionID); ok {
+			if v, ok := a.client.runs.Load(a.sessionID); ok {
 				v.(*localRun).cancel(ErrStopped)
 			}
 			continue // re-read: the run may have ended or started waiting for confirmation

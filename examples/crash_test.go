@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,5 +127,53 @@ func TestRecoverStaleOnly(t *testing.T) {
 	_ = a.Stop(ctx)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// takeoverStore hands the session to another run right before the first
+// write of a finished RPC call, i.e. after the run's last ownership check.
+type takeoverStore struct {
+	agent.Store
+	once sync.Once
+}
+
+func (s *takeoverStore) Exec(ctx context.Context, q string, args ...any) (int64, error) {
+	if strings.HasPrefix(q, "UPDATE agent_rpc_calls") && len(args) > 0 && args[0] == string(agent.CallDone) {
+		var err error
+		s.once.Do(func() {
+			_, err = s.Store.Exec(ctx, "UPDATE agent_sessions SET run_id = 'run_intruder'")
+		})
+		if err != nil {
+			return 0, err
+		}
+	}
+	return s.Store.Exec(ctx, q, args...)
+}
+
+// TestLostLockBeforeWrite: a run that loses the session between its ownership
+// check and its write must not overwrite anything (the writes are fenced).
+func TestLostLockBeforeWrite(t *testing.T) {
+	e := setup(t)
+	e.cfg.Store = &takeoverStore{Store: e.store}
+	ctx := context.Background()
+	client, err := agent.NewClient(ctx, e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := client.Agent(ctx, "", agent.AgentOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.llm.push(toolCall("a", "get_order", `{"order_id":"O1"}`))
+	if _, err := a.Chat(ctx, "go"); !errors.Is(err, agent.ErrLockLost) {
+		t.Fatalf("want ErrLockLost, got %v", err)
+	}
+	all, _ := e.client.LatestMessages(ctx, a.SessionID(), 10)
+	if statuses(all) != "done,done,running" || strings.Contains(all[2].Content, "O1") {
+		t.Fatalf("lost run wrote its result: %s %q", statuses(all), all[2].Content)
+	}
+	var status string
+	if err := e.db.QueryRow("SELECT status FROM agent_rpc_calls").Scan(&status); err != nil || status != string(agent.CallRunning) {
+		t.Fatalf("call after lost lock: %q %v", status, err)
 	}
 }

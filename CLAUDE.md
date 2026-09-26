@@ -66,6 +66,8 @@ settlement. User-facing docs are in `README.md` (Chinese).
   ends it.
 - One run per session via the `agent_sessions.run_id` lock + heartbeat; a run that
   lost the lock (`ErrLockLost`) must not write anything.
+  Updates made during a run are fenced with `st.lease` (`AND EXISTS (... run_id = ?)`),
+  so a takeover between an ownership check and the write cannot be overwritten.
 - Crash safety relies on deterministic ids for derived rows (`msg_img_<call>`,
   `msg_<queueID>`) and on `heal()` at the start of every run.
 - Calls of one turn run in parallel (`executeAll`, `Config.ToolConcurrency`); they

@@ -95,6 +95,22 @@ func (a *Agent) ownsLock(st *runState) error {
 	return nil
 }
 
+// lease fences the writes of a run: an UPDATE carrying it only applies while
+// runID still owns the session. Checking ownership first (ownsLock) leaves a
+// window in which the session can be taken over (crash recovery, a stale-run
+// takeover) before the write lands; the fence closes it, so a run that lost
+// the lock never overwrites what the new owner wrote, e.g. a final tool
+// message's raw bytes. The zero lease is unfenced (recovery outside a run).
+type lease struct{ sessionID, runID string }
+
+// fence appends the ownership condition to a query ending in a WHERE clause.
+func (l lease) fence(query string, args []any) (string, []any) {
+	if l.runID == "" {
+		return query, args
+	}
+	return query + " AND EXISTS (SELECT 1 FROM agent_sessions WHERE id = ? AND run_id = ?)", append(args, l.sessionID, l.runID)
+}
+
 func (a *Agent) release(st *runState, status Status, lastErr string) error {
 	_, err := a.store.Exec(st.db, "UPDATE agent_sessions SET status = ?, run_id = '', last_error = ?, updated_at = ? WHERE id = ? AND run_id = ?",
 		string(status), lastErr, nowMillis(), a.sessionID, st.runID)

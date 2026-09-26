@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-var running sync.Map
-
+// localRun is a run of this Client, registered in Client.runs so Stop can
+// cancel it at once instead of waiting for the run to poll the store.
 type localRun struct {
 	runID  string
 	cancel context.CancelCauseFunc
@@ -16,6 +16,7 @@ type localRun struct {
 
 type runState struct {
 	runID    string
+	lease    lease           // fences this run's updates (see lease)
 	db       context.Context // not cancelled by Stop, so bookkeeping always completes
 	cancel   context.CancelCauseFunc
 	startSeq int64 // messages with a greater seq were produced by this run
@@ -80,10 +81,10 @@ func (a *Agent) runOnce(ctx context.Context, from []Status, prepare func(context
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	lr := &localRun{runID: runID, cancel: cancel}
-	running.Store(a.sessionID, lr)
-	defer running.CompareAndDelete(a.sessionID, lr)
+	a.client.runs.Store(a.sessionID, lr)
+	defer a.client.runs.CompareAndDelete(a.sessionID, lr)
 
-	st := &runState{runID: runID, db: context.WithoutCancel(ctx), cancel: cancel, res: &RunResult{SessionID: a.sessionID}, start: time.Now()}
+	st := &runState{runID: runID, lease: lease{a.sessionID, runID}, db: context.WithoutCancel(ctx), cancel: cancel, res: &RunResult{SessionID: a.sessionID}, start: time.Now()}
 	a.log.Info("run started", "session", a.sessionID, "run", runID)
 	hbDone := a.heartbeat(runCtx, st)
 	defer hbDone()
@@ -173,7 +174,7 @@ func (a *Agent) heartbeat(ctx context.Context, st *runState) func() {
 // repairs leftovers of a crashed run (for sessions taken over without Init)
 // and records tool calls whose records or tool messages were never written.
 func (a *Agent) heal(ctx context.Context, st *runState) error {
-	if err := recoverSessionData(st.db, a.store, a.sessionID); err != nil {
+	if err := recoverSessionData(st.db, a.store, st.lease, a.sessionID); err != nil {
 		return err
 	}
 	last, err := latestMessages(st.db, a.store, a.sessionID, 1)

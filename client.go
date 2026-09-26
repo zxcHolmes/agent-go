@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 )
 
 // Client is the entry point of the SDK. It holds the store and the shared
@@ -17,6 +18,7 @@ type Client struct {
 	store Store
 	res   *resources // mounted docs and the system prompt file
 	log   *slog.Logger
+	runs  sync.Map // session id -> *localRun of this Client
 }
 
 // NewClient validates cfg, creates the tables (unless cfg.SkipSchema) and

@@ -216,7 +216,7 @@ a, err := client.Agent(ctx, sid, agent.AgentOptions{
 
 **输出被截断**：模型输出达到 `max_tokens` 时，本次运行正常结束（`StopReason = completed`），`RunResult.FinishReason` 为 `"length"`，调用 `Continue` 让模型接着写。如果截断发生在工具调用的参数中间，这个调用不会执行，模型会收到 `-32700` 错误结果并自行处理。`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
 
-**状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行期间后台每几秒心跳一次（流式输出和长时间的 RPC 调用中也会），超过 `Config.StaleAfter`（默认 1 分钟）没有心跳的会话可被其他运行接管。进程重启时由 `NewClient` 统一恢复，见“异常恢复”。
+**状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行期间后台每几秒心跳一次（流式输出和长时间的 RPC 调用中也会），超过 `Config.StaleAfter`（默认 1 分钟）没有心跳的会话可被其他运行接管；运行中的更新都带上 `run_id` 条件，被接管的旧运行即使还没察觉，也写不进任何东西。进程重启时由 `NewClient` 统一恢复，见“异常恢复”。
 
 典型 Web 服务用法：一个请求里 `go a.Chat(...)`，另一个请求用同一个 session id `client.Agent(...)` 后调 `Confirm`，或者直接 `client.Stop(ctx, sid)` / `client.Session(ctx, sid)` / `client.PendingCalls(ctx, sid)`。
 
@@ -238,7 +238,7 @@ idle ──Chat/Continue──▶ running ──完成──▶ idle
 - **未执行的调用**（排队中、已批准未执行、**等待确认中**）：结果写成 `stopped by user: this call was not executed`。
 - 以上错误码都是 `-32002`，全部写完后会话变为 `idle`。**停止完成后会话总是 `idle`**，不会停在 `waiting_confirmation`。
 
-`Stop` **不阻塞**：会话在运行中时，它只把状态改为 `stopping`（本进程的运行会被立即取消）就返回，收尾由运行自己完成。想知道是否停好了，按 session id 查 `client.Session(ctx, sid)`，`status` 变成 `idle` 即可。本进程内一般几毫秒，另一个进程里的运行约 `StopPollInterval` 内。会话在 `waiting_confirmation` 时没有运行，`Stop` 直接取消待确认调用，返回时已经是 `idle`。
+`Stop` **不阻塞**：会话在运行中时，它只把状态改为 `stopping`（同一个 `Client` 发起的运行会被立即取消）就返回，收尾由运行自己完成。想知道是否停好了，按 session id 查 `client.Session(ctx, sid)`，`status` 变成 `idle` 即可。同一个 `Client` 内一般几毫秒，其他进程（或同进程里另一个 `Client`）的运行约 `StopPollInterval` 内。会话在 `waiting_confirmation` 时没有运行，`Stop` 直接取消待确认调用，返回时已经是 `idle`。
 
 并发与竞争：
 

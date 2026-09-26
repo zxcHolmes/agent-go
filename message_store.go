@@ -109,12 +109,13 @@ func insertMessage(ctx context.Context, store Store, m *Message) error {
 
 // updateMessage rewrites the mutable parts of a message (while streaming or
 // while its tool call is in progress).
-func updateMessage(ctx context.Context, store Store, m *Message) error {
+func updateMessage(ctx context.Context, store Store, l lease, m *Message) error {
 	d := decodeMessage(m.Raw)
 	m.Content, m.ToolCalls = d.Content, d.ToolCalls
 	m.UpdatedAt = time.Now()
-	_, err := store.Exec(ctx, "UPDATE agent_messages SET status = ?, content = ?, reasoning = ?, raw = ?, updated_at = ? WHERE id = ?",
-		string(m.Status), m.Content, m.Reasoning, string(m.Raw), m.UpdatedAt.UnixMilli(), m.ID)
+	q, args := l.fence("UPDATE agent_messages SET status = ?, content = ?, reasoning = ?, raw = ?, updated_at = ? WHERE id = ?",
+		[]any{string(m.Status), m.Content, m.Reasoning, string(m.Raw), m.UpdatedAt.UnixMilli(), m.ID})
+	_, err := store.Exec(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("agent: update message: %w", err)
 	}

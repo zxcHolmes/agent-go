@@ -111,7 +111,7 @@ func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 	if err := a.checkpoint(ctx, st); err != nil {
 		return err
 	}
-	if err := setCallStatus(st.db, a.store, c, CallRunning); err != nil {
+	if err := setCallStatus(st.db, a.store, st.lease, c, CallRunning); err != nil {
 		return err
 	}
 	a.notify(ctx, st, c.ResultMessageID)
@@ -256,7 +256,7 @@ func (a *Agent) createCall(ctx context.Context, st *runState, c *RPCCall) error 
 }
 
 func (a *Agent) completeCall(ctx context.Context, st *runState, c *RPCCall, status CallStatus, result json.RawMessage) error {
-	if err := completeCall(st.db, a.store, c, status, result); err != nil {
+	if err := completeCall(st.db, a.store, st.lease, c, status, result); err != nil {
 		return err
 	}
 	a.notify(ctx, st, c.ResultMessageID)
@@ -296,7 +296,7 @@ func (a *Agent) insertMessage(ctx context.Context, st *runState, m *Message) err
 }
 
 func (a *Agent) updateMessage(ctx context.Context, st *runState, m *Message) error {
-	if err := updateMessage(st.db, a.store, m); err != nil {
+	if err := updateMessage(st.db, a.store, st.lease, m); err != nil {
 		return err
 	}
 	if a.cfg.OnMessage != nil {

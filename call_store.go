@@ -40,10 +40,11 @@ func insertCall(ctx context.Context, store Store, c *RPCCall) error {
 	return nil
 }
 
-func updateCall(ctx context.Context, store Store, c *RPCCall) error {
+func updateCall(ctx context.Context, store Store, l lease, c *RPCCall) error {
 	c.UpdatedAt = time.Now()
-	_, err := store.Exec(ctx, "UPDATE agent_rpc_calls SET status = ?, result = ?, result_message_id = ?, updated_at = ? WHERE id = ?",
-		string(c.Status), string(c.Result), c.ResultMessageID, c.UpdatedAt.UnixMilli(), c.ID)
+	q, args := l.fence("UPDATE agent_rpc_calls SET status = ?, result = ?, result_message_id = ?, updated_at = ? WHERE id = ?",
+		[]any{string(c.Status), string(c.Result), c.ResultMessageID, c.UpdatedAt.UnixMilli(), c.ID})
+	_, err := store.Exec(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("agent: update rpc call: %w", err)
 	}
@@ -70,30 +71,31 @@ func toolMessageRaw(toolCallID, content string) json.RawMessage {
 }
 
 // setCallStatus moves a call to a non-final status and mirrors it on its tool message.
-func setCallStatus(ctx context.Context, store Store, c *RPCCall, status CallStatus) error {
+func setCallStatus(ctx context.Context, store Store, l lease, c *RPCCall, status CallStatus) error {
 	c.Status = status
-	if err := updateCall(ctx, store, c); err != nil {
+	if err := updateCall(ctx, store, l, c); err != nil {
 		return err
 	}
 	ms := MessagePending
 	if status == CallRunning {
 		ms = MessageRunning
 	}
-	_, err := store.Exec(ctx, "UPDATE agent_messages SET status = ?, updated_at = ? WHERE id = ?", string(ms), nowMillis(), c.ResultMessageID)
+	q, args := l.fence("UPDATE agent_messages SET status = ?, updated_at = ? WHERE id = ?", []any{string(ms), nowMillis(), c.ResultMessageID})
+	_, err := store.Exec(ctx, q, args...)
 	return err
 }
 
 // completeCall stores the final result of a call and writes it into its tool message.
-func completeCall(ctx context.Context, store Store, c *RPCCall, status CallStatus, result json.RawMessage) error {
+func completeCall(ctx context.Context, store Store, l lease, c *RPCCall, status CallStatus, result json.RawMessage) error {
 	c.Status, c.Result = status, result
-	if err := updateCall(ctx, store, c); err != nil {
+	if err := updateCall(ctx, store, l, c); err != nil {
 		return err
 	}
 	if c.ResultMessageID == "" {
 		return nil
 	}
 	m := Message{ID: c.ResultMessageID, Status: MessageDone, Raw: toolMessageRaw(c.ToolCallID, toolContent(result))}
-	return updateMessage(ctx, store, &m)
+	return updateMessage(ctx, store, l, &m)
 }
 
 func callsForMessage(ctx context.Context, store Store, messageID string) ([]RPCCall, error) {

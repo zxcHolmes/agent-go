@@ -246,7 +246,7 @@ func (a *Agent) Confirm(ctx context.Context, decisions ...Decision) (*RunResult,
 		for _, d := range decisions {
 			c := byID[d.CallID]
 			if d.Approve {
-				err = setCallStatus(st.db, a.store, c, CallApproved)
+				err = setCallStatus(st.db, a.store, st.lease, c, CallApproved)
 			} else {
 				msg := "rejected by user"
 				if d.Reason != "" {
