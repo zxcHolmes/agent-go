@@ -136,9 +136,10 @@ type Config struct {
 	LogLevel slog.Level
 
 	// StopPollInterval is how often a running agent checks the store for a
-	// Stop issued by another process (default 1s). Stop in the same process
-	// is immediate regardless. Negative disables polling: cross-process
-	// stops are then noticed before the next step only.
+	// Stop issued by another process (default 1s). Stop from the same Client
+	// is immediate regardless. All runs of a Client are polled in one query.
+	// Negative disables polling: cross-process stops are then noticed before
+	// the next step only.
 	StopPollInterval time.Duration
 
 	// MaxRPCResultChars caps the size (in characters) of what one RPC call

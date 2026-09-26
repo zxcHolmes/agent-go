@@ -1,9 +1,6 @@
 package agent
 
-import (
-	"context"
-	"strings"
-)
+import "context"
 
 // acquire atomically moves the session to running if it is in one of the
 // allowed states, or if a previous run stopped heartbeating (crash).
@@ -15,7 +12,7 @@ func (a *Agent) acquire(ctx context.Context, from []Status) (string, error) {
 		args = append(args, string(s))
 	}
 	args = append(args, string(StatusRunning), string(StatusStopping), now-a.cfg.StaleAfter.Milliseconds())
-	ph := strings.TrimSuffix(strings.Repeat("?, ", len(from)), ", ")
+	ph := placeholders(len(from))
 	if _, err := a.store.Exec(ctx,
 		"UPDATE agent_sessions SET status = ?, run_id = ?, last_error = '', updated_at = ? WHERE id = ? AND (status IN ("+ph+") OR (status IN (?, ?) AND updated_at < ?))",
 		args...); err != nil {

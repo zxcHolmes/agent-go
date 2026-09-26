@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
 // Bill is a batch of LLM calls settled together.
@@ -56,7 +55,7 @@ func markBilled(ctx context.Context, store Store, billID string, recordIDs ...st
 	for _, id := range recordIDs {
 		args = append(args, id)
 	}
-	ph := strings.TrimSuffix(strings.Repeat("?, ", len(recordIDs)), ", ")
+	ph := placeholders(len(recordIDs))
 	_, err := store.Exec(ctx, "UPDATE agent_llm_calls SET bill_id = ?, claimed_at = ?, billed_at = ? WHERE billed_at = 0 AND id IN ("+ph+")", args...)
 	return billID, err
 }

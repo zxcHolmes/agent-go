@@ -19,6 +19,7 @@ type Client struct {
 	res   *resources // mounted docs and the system prompt file
 	log   *slog.Logger
 	runs  sync.Map // session id -> *localRun of this Client
+	mon   monitor  // heartbeats and stop polls of this Client's runs
 }
 
 // NewClient validates cfg, creates the tables (unless cfg.SkipSchema) and
@@ -33,6 +34,7 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, err
 	}
 	c := &Client{cfg: cfg, store: cfg.Store, res: res, log: newLogger(cfg)}
+	c.mon.store, c.mon.log = c.store, c.log
 	if !cfg.SkipSchema {
 		if err := migrate(ctx, c.store); err != nil {
 			return nil, err

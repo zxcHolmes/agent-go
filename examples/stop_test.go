@@ -308,3 +308,79 @@ func TestStopDuringStream(t *testing.T) {
 		t.Fatalf("history: %s", msgs[2])
 	}
 }
+
+// pollCountStore counts the monitor's batched stop polls.
+type pollCountStore struct {
+	agent.Store
+	polls atomic.Int64
+}
+
+func (s *pollCountStore) Query(ctx context.Context, q string, args ...any) (agent.Rows, error) {
+	if strings.HasPrefix(q, "SELECT id, run_id, status FROM agent_sessions WHERE id IN") {
+		s.polls.Add(1)
+	}
+	return s.Store.Query(ctx, q, args...)
+}
+
+// TestStopPollIsBatched: the runs of a Client are polled together, so the
+// number of polls does not grow with the number of running sessions, and a
+// cross-process stop still reaches each of them.
+func TestStopPollIsBatched(t *testing.T) {
+	const runs = 10
+	e := setup(t)
+	cs := &pollCountStore{Store: e.store}
+	e.cfg.Store = cs
+	e.cfg.StopPollInterval = 100 * time.Millisecond
+	e.llm.hung = make(chan struct{}, runs)
+	ctx := context.Background()
+	client, err := agent.NewClient(ctx, e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sids []string
+	done := make(chan error, runs)
+	for i := 0; i < runs; i++ {
+		a, err := client.Agent(ctx, "", agent.AgentOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sids = append(sids, a.SessionID())
+		e.llm.pushReply(reply{msg: text("never finished"), hangAfter: 0})
+		go func() {
+			_, err := a.Chat(ctx, "hi")
+			done <- err
+		}()
+		<-e.llm.hung
+	}
+	before := cs.polls.Load()
+	time.Sleep(time.Second)
+	if n := cs.polls.Load() - before; n < 5 || n > 15 {
+		t.Fatalf("%d polls in 1s for %d runs at a 100ms interval, want about 10", n, runs)
+	}
+
+	// Stop through another client (another process): only the poll can see it.
+	for _, sid := range sids {
+		other, err := e.client.Agent(ctx, sid, agent.AgentOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := other.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < runs; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("run not stopped by the poll")
+		}
+	}
+	for _, sid := range sids {
+		if s, _ := e.client.Session(ctx, sid); s.Status != agent.StatusIdle {
+			t.Fatalf("session %s: %s", sid, s.Status)
+		}
+	}
+}

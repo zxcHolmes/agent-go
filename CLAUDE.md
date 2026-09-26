@@ -89,7 +89,9 @@ settlement. User-facing docs are in `README.md` (Chinese).
 - `config.go` — `Config` (client-wide), `AgentOptions`, `CompactionMode`, defaults.
 - `agent.go` — `Agent` construction and public run methods (Chat, ChatMessage,
   Continue, Confirm, Enqueue).
-- `run.go` — run lifecycle: acquire, heartbeat, heal, finish.
+- `run.go` — run lifecycle: acquire, heal, finish.
+- `monitor.go` — per-Client batched heartbeat and cross-process stop poll
+  (one UPDATE / one SELECT per interval for all runs, never one per run).
 - `lock.go` — session lock (acquire/checkpoint/release).
 - `stop.go` — non-blocking, idempotent Stop (marks `stopping`, cancels a
   local run) incl. taking over dead runs.

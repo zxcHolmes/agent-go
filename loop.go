@@ -108,8 +108,10 @@ func (a *Agent) executeAll(ctx context.Context, st *runState, calls []*RPCCall) 
 // is stopped meanwhile, the call is closed at once without waiting for the
 // handler, whose late result is discarded.
 func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
-	if err := a.checkpoint(ctx, st); err != nil {
-		return err
+	// The loop checkpointed just before this turn and the monitor cancels
+	// ctx on a stop or lost lock, so the ctx is all there is to check here.
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
 	}
 	if err := setCallStatus(st.db, a.store, st.lease, c, CallRunning); err != nil {
 		return err

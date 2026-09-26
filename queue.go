@@ -100,6 +100,25 @@ const (
 )
 
 // queuedMessages lists the rows in the given state, oldest first.
+// queuedCount counts the waiting and taken (claimed by a run that has not
+// added them yet) messages of a session.
+func queuedCount(ctx context.Context, store Store, sessionID string) (int64, error) {
+	rows, err := store.Query(ctx, "SELECT COUNT(*) AS queued FROM agent_queued_messages WHERE session_id = ? AND status IN (?, ?)",
+		sessionID, queueWaiting, queueTaken)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var n int64
+	if rows.Next() {
+		err = rows.Scan(&n)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return n, rows.Err()
+}
+
 func queuedMessages(ctx context.Context, store Store, sessionID, status string) ([]QueuedMessage, error) {
 	rows, err := store.Query(ctx, "SELECT id, session_id, content, raw, created_at FROM agent_queued_messages WHERE session_id = ? AND status = ? ORDER BY created_at ASC, id ASC", sessionID, status)
 	if err != nil {
@@ -204,6 +223,10 @@ func (a *Agent) userMessage(raw json.RawMessage) (Message, error) {
 // it, so a crash in between never loses or duplicates one: rows left taken
 // by a crashed run are picked up here by the next one.
 func (a *Agent) drainQueue(ctx context.Context, st *runState) (int, error) {
+	// Usually nothing is queued: look first (one read) before claiming.
+	if n, err := queuedCount(st.db, a.store, a.sessionID); err != nil || n == 0 {
+		return 0, err
+	}
 	q, args := st.lease.fence("UPDATE agent_queued_messages SET status = ? WHERE session_id = ? AND status = ?",
 		[]any{queueTaken, a.sessionID, queueWaiting})
 	if _, err := a.store.Exec(st.db, q, args...); err != nil {

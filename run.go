@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 )
 
@@ -86,7 +85,7 @@ func (a *Agent) runOnce(ctx context.Context, from []Status, prepare func(context
 
 	st := &runState{runID: runID, lease: lease{a.sessionID, runID}, db: context.WithoutCancel(ctx), cancel: cancel, res: &RunResult{SessionID: a.sessionID}, start: time.Now()}
 	a.log.Info("run started", "session", a.sessionID, "run", runID)
-	hbDone := a.heartbeat(runCtx, st)
+	hbDone := a.client.mon.watch(a, st) // heartbeat + cross-process stop poll
 	defer hbDone()
 
 	var reason StopReason
@@ -104,70 +103,6 @@ func (a *Agent) runOnce(ctx context.Context, from []Status, prepare func(context
 	}
 	hbDone()
 	return a.finish(runCtx, st, reason, err)
-}
-
-// heartbeat keeps the session lock fresh while the run is alive (a write
-// every StaleAfter/4, at most 5s) and, every Config.StopPollInterval, reads
-// the session row to notice a Stop issued by another process (status
-// "stopping") or a lost lock, so either interrupts even a long stream or RPC
-// call. The returned func stops it and waits for it to exit.
-func (a *Agent) heartbeat(ctx context.Context, st *runState) func() {
-	beatEvery := a.cfg.StaleAfter / 4
-	if beatEvery > 5*time.Second {
-		beatEvery = 5 * time.Second
-	}
-	poll := a.cfg.StopPollInterval // <0: no polling
-	tick := beatEvery
-	if poll > 0 && poll < tick {
-		tick = poll
-	}
-	if tick < 50*time.Millisecond {
-		tick = 50 * time.Millisecond
-	}
-	quit := make(chan struct{})
-	exited := make(chan struct{})
-	go func() {
-		defer close(exited)
-		t := time.NewTicker(tick)
-		defer t.Stop()
-		lastBeat, lastPoll := time.Now(), time.Now()
-		for {
-			select {
-			case <-quit:
-				return
-			case <-ctx.Done():
-				return
-			case <-t.C:
-			}
-			if time.Since(lastBeat) >= beatEvery {
-				lastBeat = time.Now()
-				if _, err := a.store.Exec(st.db, "UPDATE agent_sessions SET updated_at = ? WHERE id = ? AND run_id = ?", nowMillis(), a.sessionID, st.runID); err != nil {
-					a.log.Warn("heartbeat failed", "session", a.sessionID, "error", err)
-				}
-			}
-			if poll <= 0 || time.Since(lastPoll) < poll {
-				continue
-			}
-			lastPoll = time.Now()
-			owner, status, err := a.sessionLock(st.db)
-			switch {
-			case err != nil:
-				a.log.Warn("stop poll failed", "session", a.sessionID, "error", err)
-			case owner != st.runID:
-				a.log.Warn("session taken over by another run; abandoning this one", "session", a.sessionID, "run", st.runID)
-				st.cancel(ErrLockLost)
-				return
-			case status == StatusStopping:
-				st.cancel(ErrStopped)
-				return
-			}
-		}
-	}()
-	var once sync.Once
-	return func() {
-		once.Do(func() { close(quit) })
-		<-exited
-	}
 }
 
 // heal brings the session back to a consistent state before running: it
