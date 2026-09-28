@@ -78,6 +78,10 @@ settlement. User-facing docs are in `README.md` (Chinese).
 - A step reads only messages from the latest compaction point
   (`latestCompaction` + `messagesFromSeq`); never load a whole session.
 - Every LLM request (chat and summary) goes through `beforeLLMCall` first.
+- `ResetContext` is a compaction marker with `RefSeq = its own seq + 1` and no
+  summary, written under the session lock (acquired from idle only, healed
+  first like a run). Never insert a marker outside the lock: landing mid-turn
+  would split an assistant's `tool_calls` from their tool messages.
 - After a compaction, the last LLM call's token count no longer describes the
   window (`estimateTokens` checks this); usage rows of summary calls point at the
   compaction message, not an assistant message.

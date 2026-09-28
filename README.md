@@ -166,6 +166,7 @@ client.Stop(ctx, sid)                                  // 不创建 agent 也能
 client.PendingCalls(ctx, sid)                          // 待确认的 RPC 调用
 client.Enqueue(ctx, sid, "补充一点……")                 // 运行中追加用户消息（见“消息队列”）
 client.ResetSession(ctx, sid)                          // 手动恢复单个会话（见“异常恢复”）
+client.ResetContext(ctx, sid)                          // 手动重置上下文：之前的消息不再发给模型，历史保留（见“上下文压缩”）
 client.DeleteSession(ctx, sid)                         // 删除会话（见下文）
 client.Recover(ctx)                                    // 重新执行一次启动时的崩溃恢复
 ```
@@ -562,9 +563,13 @@ type Billing interface { Cost(model string, usage agent.Usage) agent.Cost }
 
 查询：
 
+`LatestUsage` 只读一行（按 `session_id, created_at` 索引），适合每次轮询都调用：它的 `PromptTokens` 就是最近一次请求的真实大小，是“上下文用了多少”唯一靠谱的数字；`Usage` 是整个会话所有调用的累计，不能拿来除以上下文长度。
+
+
 ```go
-recs, _ := client.ListUsage(ctx, sid)   // 每次调用明细
-sum, _ := client.Usage(ctx, sid)        // 累计汇总（含已结算）
+recs, _ := client.ListUsage(ctx, sid)     // 每次调用明细
+sum, _ := client.Usage(ctx, sid)          // 累计汇总（含已结算）
+last, _ := client.LatestUsage(ctx, sid)   // 最近一次调用，没有时为 nil
 ```
 
 #### 结算（扣积分）
@@ -646,6 +651,12 @@ agent.Config{
 - 摘要模式下，交给模型总结的对话会按 token 预算截取：每条长消息先单独截短，仍然超长时去掉中间部分，保留开头（上一次的摘要、最早的关键信息）和结尾。
 
 实测（`ContextLength: 5000`，每轮约 600 token 的长回答）：prompt 从 62 增长到 3786 token 后触发压缩，下一次请求降到 37 token（anchor 模式）或 224 token（summary 模式，模型依然记得最开始告诉它的暗号）。
+
+**手动重置上下文**：`client.ResetContext(ctx, sid)`（或 `a.ResetContext(ctx)`）插入一条压缩消息（`Kind = "compaction"`，`status = excluded`），`RefSeq` 指向它自己之后，所以之后发给模型的历史从下一条消息开始。不做摘要、不删除任何消息，前端照常看到完整历史，session id 继续可用。适合用户明确不再需要之前的对话时使用；只是太长的话交给自动压缩即可。
+
+- 只能在会话空闲时调用：运行中返回 `ErrBusy`，等待确认时返回 `ErrWaitingConfirmation`（待确认的调用会保留）。重置期间持有会话锁，不会插进一次运行的中间。
+- 会话的 `last_error` 保持不变。
+- 重置后用 `Chat`（或 `Enqueue` + `Continue`）继续；单独调用 `Continue` 会把空历史发给模型。
 
 ### 消息队列（运行中追加用户消息）
 

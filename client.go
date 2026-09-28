@@ -202,6 +202,15 @@ func (c *Client) Message(ctx context.Context, sessionID, messageID string) (*Mes
 
 // ---- usage & billing ----
 
+// LatestUsage returns the newest LLM call of a session (chat or summary), or
+// nil when the session has made none. Its PromptTokens is the size of the
+// latest request — the honest read of how full the context window is — where
+// Usage sums every call the session ever made. It reads one row, so it is
+// cheap to call on every poll.
+func (c *Client) LatestUsage(ctx context.Context, sessionID string) (*UsageRecord, error) {
+	return latestUsage(ctx, c.store, sessionID)
+}
+
 // Usage sums token usage and credits over all LLM calls of a session.
 func (c *Client) Usage(ctx context.Context, sessionID string) (*UsageSummary, error) {
 	return sessionUsage(ctx, c.store, sessionID)

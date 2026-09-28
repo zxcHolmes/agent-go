@@ -22,7 +22,12 @@ func insertUsage(ctx context.Context, store Store, r *UsageRecord) error {
 }
 
 func queryUsage(ctx context.Context, store Store, where string, args ...any) ([]UsageRecord, error) {
-	rows, err := store.Query(ctx, "SELECT "+usageCols+" FROM agent_llm_calls WHERE "+where+" ORDER BY created_at ASC", args...)
+	return queryUsageOrdered(ctx, store, where, "created_at ASC", args...)
+}
+
+// queryUsageOrdered is queryUsage with a caller-chosen ORDER BY (and LIMIT).
+func queryUsageOrdered(ctx context.Context, store Store, where, order string, args ...any) ([]UsageRecord, error) {
+	rows, err := store.Query(ctx, "SELECT "+usageCols+" FROM agent_llm_calls WHERE "+where+" ORDER BY "+order, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -53,6 +58,16 @@ func queryUsage(ctx context.Context, store Store, where string, args ...any) ([]
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// latestUsage returns the newest LLM call of a session, or nil if it has none.
+// One indexed row (idx_agent_llm_calls_session), however long the session.
+func latestUsage(ctx context.Context, store Store, sessionID string) (*UsageRecord, error) {
+	recs, err := queryUsageOrdered(ctx, store, "session_id = ?", "created_at DESC, id DESC LIMIT 1", sessionID)
+	if err != nil || len(recs) == 0 {
+		return nil, err
+	}
+	return &recs[0], nil
 }
 
 // listUsage returns every LLM call of a session, oldest first.
