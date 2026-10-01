@@ -51,7 +51,9 @@ type streamOptions struct {
 // deltaFunc receives text as it streams in. Returning an error aborts the stream.
 type deltaFunc func(content, reasoning string) error
 
-// errStreamStarted marks errors after output was received; those are not retried.
+// streamBrokenError marks a stream that failed after text or reasoning had
+// already been passed to onDelta, i.e. after something may have been shown and
+// stored. stream does not retry it; the run loop decides (see runLoop).
 type streamBrokenError struct{ err error }
 
 func (e *streamBrokenError) Error() string { return "agent: llm stream interrupted: " + e.err.Error() }
@@ -128,7 +130,13 @@ func (c *llmClient) doStream(parent context.Context, body []byte, onDelta deltaF
 	}
 
 	acc := &streamAccumulator{}
-	started := false // after the first delta, failures are not retried
+	// started is set once text or reasoning has been handed to onDelta. Only
+	// that output is visible outside this call (it is flushed to the store and
+	// streamed to the caller); a role-only chunk or tool-call fragments live in
+	// acc alone and are discarded with it, so a stream that breaks before any
+	// text is safe to retry from scratch. That is the common case for an agent:
+	// a turn that only calls tools never sends text at all.
+	started := false
 	fail := func(err error) (*streamResult, bool, error) {
 		if cause := context.Cause(ctx); cause == errIdleTimeout {
 			err = cause
@@ -183,7 +191,7 @@ func (c *llmClient) doStream(parent context.Context, body []byte, onDelta deltaF
 				return nil, retry, &APIError{StatusCode: status, Body: truncate(string(chunk.Error), 2000)}
 			}
 			content, reasoning := acc.add(&chunk)
-			if content != "" || reasoning != "" || len(chunk.Choices) > 0 {
+			if content != "" || reasoning != "" {
 				started = true
 			}
 			if (content != "" || reasoning != "") && onDelta != nil {

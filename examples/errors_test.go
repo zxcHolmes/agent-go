@@ -53,3 +53,50 @@ func TestInStreamTransientErrorIsRetried(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// Seen live: a proxy reset the connection while the model was emitting a tool
+// call. Nothing had been shown — tool-call fragments are never streamed out —
+// so the request is simply retried, and the user never sees the break.
+func TestToolCallStreamBreakIsRetried(t *testing.T) {
+	e := setup(t)
+	e.cfg.MaxRetries = 2
+	a := e.newAgent(t, "")
+	e.llm.pushReply(reply{msg: toolCall("c1", "get_order", `{"order_id":"A-1"}`), hangAfter: -1, cut: 1})
+	e.llm.push(toolCall("c1", "get_order", `{"order_id":"A-1"}`), text("done"))
+	res, err := a.Chat(context.Background(), "hi")
+	if err != nil || res.Reply() != "done" || len(e.llm.requests) != 3 {
+		t.Fatalf("%v %v requests=%d", res, err, len(e.llm.requests))
+	}
+	for _, m := range res.Messages {
+		if m.Status == agent.MessageInterrupted {
+			t.Fatalf("a retried stream left an interrupted message: %+v", m)
+		}
+	}
+}
+
+// A stream that breaks after text was shown is not retried inside the request
+// (the text is already stored), but the run retries the step once: the partial
+// reply is kept and replayed, and the model continues from it.
+func TestStreamBreakAfterTextRetriesTheStepOnce(t *testing.T) {
+	e := setup(t)
+	a := e.newAgent(t, "")
+	e.llm.pushReply(reply{msg: text("Let me look that up for you"), hangAfter: -1, cut: 2})
+	e.llm.push(text("ok"))
+	res, err := a.Chat(context.Background(), "hi")
+	if err != nil || res.Reply() != "ok" || len(e.llm.requests) != 2 {
+		t.Fatalf("%v %v requests=%d", res, err, len(e.llm.requests))
+	}
+	if got := statuses(res.Messages); !strings.Contains(got, string(agent.MessageInterrupted)) {
+		t.Fatalf("the partial reply should be kept as interrupted: %s", got)
+	}
+	if last := e.llm.request(1); !strings.Contains(string(last[len(last)-1]), "Let me") {
+		t.Fatalf("the retry should replay the partial reply, got %s", last[len(last)-1])
+	}
+
+	// Only once: a second break in the same step ends the run.
+	e.llm.pushReply(reply{msg: text("Let me look that up for you"), hangAfter: -1, cut: 2})
+	e.llm.pushReply(reply{msg: text("Let me look that up for you"), hangAfter: -1, cut: 2})
+	if _, err := a.Chat(context.Background(), "again"); err == nil || !strings.Contains(err.Error(), "llm stream interrupted") {
+		t.Fatalf("want a broken stream error, got %v", err)
+	}
+}

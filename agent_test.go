@@ -129,3 +129,42 @@ func TestBuildBodyExtra(t *testing.T) {
 		t.Fatalf("nil should remove the field: %s", b)
 	}
 }
+
+func TestMalformedRequestErrorsSayHowToFix(t *testing.T) {
+	a := &Agent{log: newLogger(Config{}), methods: map[string]Method{
+		"get_credits": NewMethod("get_credits", func(ctx context.Context, c *Call, p struct{}) (int, error) { return 1, nil }, MethodDoc{}),
+		"get_order": NewMethod("get_order", func(ctx context.Context, c *Call, p struct {
+			OrderID string `json:"order_id" required:"true"`
+			Verbose bool   `json:"verbose"`
+		}) (int, error) {
+			return 1, nil
+		}, MethodDoc{}),
+	}}
+	// Seen live: the method name sent in "jsonrpc".
+	args := `{"jsonrpc":"get_credits","params":{},"id":6}`
+	req, rerr := parseRPCRequest(args)
+	rerr = a.misplacedMethodHint(args, req, rerr)
+	if rerr == nil || rerr.Code != CodeInvalidRequest ||
+		!strings.Contains(rerr.Message, `put in "jsonrpc"`) ||
+		!strings.Contains(rerr.Message, `{"jsonrpc":"2.0","method":"get_credits","params":{},"id":6}`) {
+		t.Fatalf("got %+v", rerr)
+	}
+	// No method anywhere: the generic message still quotes the request shape.
+	args = `{"jsonrpc":"2.0","params":{}}`
+	req, rerr = parseRPCRequest(args)
+	rerr = a.misplacedMethodHint(args, req, rerr)
+	if rerr == nil || !strings.Contains(rerr.Message, rpcRequestShape) {
+		t.Fatalf("got %+v", rerr)
+	}
+	// A well-formed request is untouched.
+	args = `{"jsonrpc":"2.0","method":"get_credits","params":{},"id":1}`
+	req, rerr = parseRPCRequest(args)
+	if rerr = a.misplacedMethodHint(args, req, rerr); rerr != nil {
+		t.Fatalf("got %+v", rerr)
+	}
+	// An unknown field names the params the method does accept.
+	out := string(a.invoke(context.Background(), &RPCCall{Method: "get_order", Params: json.RawMessage(`{"orderId":"A"}`), RPCID: json.RawMessage("1")}))
+	if !strings.Contains(out, `"code":-32602`) || !strings.Contains(out, "accepts only these params") || !strings.Contains(out, "order_id") {
+		t.Fatalf("got %s", out)
+	}
+}

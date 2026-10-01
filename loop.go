@@ -10,8 +10,16 @@ import (
 	"time"
 )
 
+// brokenStreamRetries is how many times one step is retried after its stream
+// broke part-way through visible output. The interrupted message keeps the
+// text already produced and is replayed, so the model sees what it said and
+// carries on from there — the same thing Continue does, without waiting for
+// the user. Breaks before any visible output are retried inside llm.stream.
+const brokenStreamRetries = 1
+
 func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 	llmCalls := 0
+	brokenRetries := 0
 	for {
 		if err := a.checkpoint(ctx, st); err != nil {
 			return "", err
@@ -51,8 +59,16 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 				llmCalls--
 				continue // retry without the images the provider could not load
 			}
+			var broken *streamBrokenError
+			if errors.As(err, &broken) && ctx.Err() == nil && brokenRetries < brokenStreamRetries {
+				brokenRetries++
+				llmCalls--
+				a.log.Info("llm stream broke after output, retrying the step", "session", a.sessionID, "error", err)
+				continue
+			}
 			return "", err
 		}
+		brokenRetries = 0
 		if !hasCalls {
 			// Messages queued while the model was answering still need an answer.
 			if queued, err := a.hasQueued(st); err != nil {
@@ -193,6 +209,7 @@ func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
 		return c
 	}
 	req, rerr := parseRPCRequest(tc.Function.Arguments)
+	rerr = a.misplacedMethodHint(tc.Function.Arguments, req, rerr)
 	c.Method, c.Params, c.RPCID = req.Method, req.Params, req.ID
 	if len(c.RPCID) == 0 || string(c.RPCID) == "null" {
 		c.RPCID = fallbackID

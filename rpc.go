@@ -109,10 +109,15 @@ func (c *Call) Bind(v any) error {
 	dec := json.NewDecoder(bytes.NewReader(p))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		return InvalidParams("invalid params: %v", err)
+		return InvalidParams(bindErrorPrefix+"%v", err)
 	}
 	return nil
 }
+
+// bindErrorPrefix starts every error Bind returns, so invoke can tell a
+// decoding failure (worth listing the accepted params for) from a handler's
+// own validation message.
+const bindErrorPrefix = "invalid params: "
 
 type callKey struct{}
 
@@ -179,10 +184,17 @@ type rpcRequest struct {
 	ID      json.RawMessage `json:"id"`
 }
 
+// rpcRequestShape is the request form quoted in every malformed-request error,
+// so the model can rebuild the call from the error alone.
+const rpcRequestShape = `{"jsonrpc":"2.0","method":"<method name>","params":{...},"id":1}`
+
+// Malformed requests get errors that say exactly what to resend: the model
+// fixes a call from its error message, and a bare "invalid request" leaves it
+// guessing, or makes it give up and end the turn.
 func parseRPCRequest(arguments string) (rpcRequest, *RPCError) {
 	var req rpcRequest
 	if err := json.Unmarshal([]byte(arguments), &req); err != nil {
-		return req, &RPCError{Code: CodeParseError, Message: "tool arguments must be one JSON-RPC request object: " + err.Error()}
+		return req, &RPCError{Code: CodeParseError, Message: fmt.Sprintf("the tool arguments must be one JSON object of the form %s, but they could not be parsed (%v). Resend the call as valid JSON in that form.", rpcRequestShape, err)}
 	}
 	req.Params = bytes.TrimSpace(req.Params)
 	// Some models send params as a JSON-encoded string.
@@ -196,7 +208,7 @@ func parseRPCRequest(arguments string) (rpcRequest, *RPCError) {
 		req.Params = json.RawMessage("{}")
 	}
 	if req.Method == "" {
-		return req, &RPCError{Code: CodeInvalidRequest, Message: `"method" is required`}
+		return req, &RPCError{Code: CodeInvalidRequest, Message: fmt.Sprintf(`"method" is missing. Put the method name in "method" and its parameters in "params", as %s, and resend the call.`, rpcRequestShape)}
 	}
 	return req, nil
 }
@@ -257,6 +269,15 @@ func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage)
 		if !errors.As(err, &re) {
 			re = &RPCError{Code: CodeInternalError, Message: err.Error()}
 		}
+		// A decoding failure from Bind names the bad field but not the good
+		// ones; add them. Errors written by the handler itself are left alone.
+		if re.Code == CodeInvalidParams && strings.HasPrefix(re.Message, bindErrorPrefix) {
+			if hint := paramsHint(m.Params); hint != "" {
+				copied := *re
+				copied.Message += hint
+				re = &copied
+			}
+		}
 		return rpcErrorResponse(rec.RPCID, a.limitError(re))
 	}
 	out, err := rpcResultResponse(rec.RPCID, a.limitResult(result))
@@ -267,7 +288,86 @@ func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage)
 }
 
 func (a *Agent) methodNotFound(name string) *RPCError {
-	return &RPCError{Code: CodeMethodNotFound, Message: fmt.Sprintf("method %q not found; available methods: %s", name, strings.Join(a.methodNames(), ", "))}
+	return &RPCError{Code: CodeMethodNotFound, Message: fmt.Sprintf("method %q does not exist. Resend the call with one of these in \"method\": %s", name, strings.Join(a.methodNames(), ", "))}
+}
+
+// misplacedMethodHint improves a "method is missing" error when the request
+// does name a registered method, only under the wrong key — most often
+// {"jsonrpc":"get_credits",...}. The message names the key it found and quotes
+// the corrected request with the model's own params and id, so the fix is a
+// copy rather than a guess. The call is still refused: guessing which field
+// was meant would hide the mistake and let it recur.
+func (a *Agent) misplacedMethodHint(arguments string, req rpcRequest, e *RPCError) *RPCError {
+	if e == nil || e.Code != CodeInvalidRequest || req.Method != "" {
+		return e
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal([]byte(arguments), &fields) != nil {
+		return e
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		var name string
+		if json.Unmarshal(fields[key], &name) != nil {
+			continue
+		}
+		if _, ok := a.methods[name]; !ok {
+			continue
+		}
+		id := req.ID
+		if len(id) == 0 || string(id) == "null" {
+			id = json.RawMessage("1")
+		}
+		fixed, err := marshalJSON(rpcRequest{JSONRPC: "2.0", Method: name, Params: req.Params, ID: id})
+		if err != nil {
+			return e
+		}
+		explain := ""
+		if key == "jsonrpc" {
+			explain = ` "jsonrpc" is always "2.0".`
+		}
+		return &RPCError{Code: CodeInvalidRequest, Message: fmt.Sprintf(`"method" is missing: the method name %q was put in %q instead.%s The method name goes in "method". Resend exactly this: %s`, name, key, explain, fixed)}
+	}
+	return e
+}
+
+// paramsHint lists the params a method accepts, taken from its JSON Schema,
+// for an error raised while decoding them (an unknown field, a wrong type).
+func paramsHint(schema any) string {
+	if schema == nil {
+		return ""
+	}
+	b, err := marshalJSON(schema)
+	if err != nil {
+		return ""
+	}
+	var s struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if json.Unmarshal(b, &s) != nil {
+		return ""
+	}
+	if len(s.Properties) == 0 {
+		return ` This method takes no params: send "params":{}.`
+	}
+	required := map[string]bool{}
+	for _, r := range s.Required {
+		required[r] = true
+	}
+	names := make([]string, 0, len(s.Properties))
+	for n := range s.Properties {
+		if required[n] {
+			n += " (required)"
+		}
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return " This method accepts only these params: " + strings.Join(names, ", ") + ". Fix the params and resend."
 }
 
 func (a *Agent) methodNames() []string {

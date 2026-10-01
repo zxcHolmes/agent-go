@@ -496,7 +496,8 @@ func TestRequestBodyOptions(t *testing.T) {
 }
 
 // A stream that goes silent is aborted after StreamIdleTimeout. Before any
-// output it is retried; after output it is not (the partial text is kept).
+// output the request is retried; after output the partial text is kept and the
+// run retries the step once, so two silent streams in a row end the run.
 func TestStreamIdleTimeout(t *testing.T) {
 	e := setup(t)
 	e.cfg.StreamIdleTimeout = 200 * time.Millisecond
@@ -510,6 +511,7 @@ func TestStreamIdleTimeout(t *testing.T) {
 		t.Fatalf("%+v %v", res, err)
 	}
 
+	e.llm.pushReply(reply{msg: text("abcdefghi"), hangAfter: 1})
 	e.llm.pushReply(reply{msg: text("abcdefghi"), hangAfter: 1})
 	start := time.Now()
 	_, err = a.Chat(ctx, "again")

@@ -342,10 +342,10 @@ Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 
 | 情况 | 返回给模型的 code |
 | --- | --- |
-| 参数 JSON 解析失败 | `-32700` |
-| 缺少 `method` | `-32600` |
+| 参数 JSON 解析失败（附正确的请求格式） | `-32700` |
+| 缺少 `method`（附正确的请求格式；如果方法名被写进了别的字段，比如 `{"jsonrpc":"get_credits"}`，会指出写错的字段，并给出改正后可直接重发的完整请求） | `-32600` |
 | 方法不存在（会附带可用方法列表） | `-32601` |
-| `agent.InvalidParams(...)` / `Bind` 失败 / `Validate` 失败 | `-32602` |
+| `agent.InvalidParams(...)` / `Bind` 失败 / `Validate` 失败。`Bind` 解码失败（未知字段、类型不对）时会附上该方法接受的参数列表；handler 自己写的错误原样返回 | `-32602` |
 | handler 返回普通 error 或 panic | `-32603`。message 为错误内容；panic 时只给模型 panic 的值，完整堆栈写入日志 |
 | 用户拒绝确认 | `-32001` |
 | 超过超时时间（`Method.Timeout` / `Config.RPCTimeout`） | `-32004` |
@@ -353,7 +353,7 @@ Handler: func(ctx context.Context, call *agent.Call) (any, error) {
 | 执行过程中进程崩溃（可能已生效，也可能没有） | `-32003` |
 | 自定义 | `agent.NewRPCError(code, msg, data)` |
 
-所有这些错误都只回给模型，不会中断 agent loop，模型可以自行修正后重试。
+所有这些错误都只回给模型，不会中断 agent loop，模型可以自行修正后重试。格式错误的报错都写明了"应该怎么重发"，因为模型是照着报错改请求的，只说"invalid request"它往往只能猜，或者干脆结束这一轮。
 
 ### 文档挂载（read_doc）与系统提示词文件
 
@@ -761,7 +761,7 @@ agent.Config{
 | `ExtraBody` | 合并进请求体，如 `temperature`、`top_p`、`reasoning_effort`；值为 `nil` 表示删除默认字段，例如不支持 `stream_options` 的服务可设 `"stream_options": nil` |
 | `UseMaxCompletionTokens` | 用 `max_completion_tokens` 代替 `max_tokens`（新版 OpenAI 推理模型） |
 | `Headers` / `HTTPClient` | 自定义请求头 / HTTP 客户端（默认不设整体超时，由 `StreamIdleTimeout` 兜底） |
-| `MaxRetries` | 429 / 5xx / 网络错误重试次数，默认 2，负数关闭；已经开始输出后不再重试。代理在 HTTP 200 的流里返回的错误（如 `{"error":{"code":502}}`）也按其中的 code 判断是否重试 |
+| `MaxRetries` | 429 / 5xx / 网络错误重试次数，默认 2，负数关闭。"已经开始输出"指已经有正文或推理文字推送出去；只收到工具调用片段时断开（agent 最常见的情况，这些片段不会推给前端也不入库）照样重试。已经推送过文字后断开，不在请求内重试：半截文字保留为 `interrupted`，由 run 在同一轮里再走一步（每步最多一次），模型会看到自己说过的半截话接着说，相当于自动按了一次 Continue。代理在 HTTP 200 的流里返回的错误（如 `{"error":{"code":502}}`）也按其中的 code 判断是否重试 |
 | `MaxSteps` | 单次运行最多 LLM 调用次数，默认 50 |
 | `StaleAfter` | 运行锁心跳超时，默认 1 分钟 |
 | `StopPollInterval` | 检查其他进程发来的 Stop 的间隔，默认 1 秒，负数关闭 |

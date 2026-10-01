@@ -24,6 +24,7 @@ type reply struct {
 	msg       string        // assistant message JSON
 	delay     time.Duration // pause between content chunks
 	hangAfter int           // hang after this many content chunks (-1 = never)
+	cut       int           // close the stream after this many chunks of any kind (0 = never)
 	httpErr   int           // respond with this HTTP status and body instead
 	streamErr string        // send this error object inside a 200 stream instead
 	body      string
@@ -70,11 +71,16 @@ func (f *fakeLLM) handler(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal([]byte(rp.msg), &m)
 	w.Header().Set("Content-Type", "text/event-stream")
 	fl := w.(http.Flusher)
+	sent := 0
 	send := func(v any) {
 		b, _ := json.Marshal(v)
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		fl.Flush()
+		sent++
 	}
+	// cutNow ends the response without a finish reason, as a connection reset
+	// mid-stream looks to the client.
+	cutNow := func() bool { return rp.cut > 0 && sent >= rp.cut }
 	hang := func() {
 		f.hung <- struct{}{}
 		<-r.Context().Done()
@@ -92,6 +98,9 @@ func (f *fakeLLM) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		send(map[string]any{"id": "resp_1", "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": p}}}})
+		if cutNow() {
+			return
+		}
 		time.Sleep(rp.delay)
 	}
 	if rp.hangAfter >= 0 && rp.hangAfter >= len(pieces) {
@@ -101,6 +110,9 @@ func (f *fakeLLM) handler(w http.ResponseWriter, r *http.Request) {
 	for i, tc := range m.ToolCalls {
 		tc["index"] = i
 		send(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{tc}}}}})
+		if cutNow() {
+			return
+		}
 	}
 	finish := "stop"
 	if len(m.ToolCalls) > 0 {
