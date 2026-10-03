@@ -195,6 +195,14 @@ func (c *Client) MessagesAfter(ctx context.Context, sessionID, messageID string,
 	return messagesAfter(ctx, c.store, sessionID, messageID, limit)
 }
 
+// MessagesAfterSeq is MessagesAfter for a caller that already knows the
+// cursor's seq (Message.Seq of a message it read before): one query instead of
+// two. A message's seq never changes once written, so a poller can remember
+// the seq of its cursor and skip the id lookup on every poll.
+func (c *Client) MessagesAfterSeq(ctx context.Context, sessionID string, seq int64, limit int) ([]Message, error) {
+	return messagesAfterSeqLimit(ctx, c.store, sessionID, seq, limit)
+}
+
 // Message loads one message.
 func (c *Client) Message(ctx context.Context, sessionID, messageID string) (*Message, error) {
 	return getMessage(ctx, c.store, sessionID, messageID)

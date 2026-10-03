@@ -456,6 +456,7 @@ user       [{"type":"text","text":"[view_image result for call_x] https://cdn.ex
 client.LatestMessages(ctx, sid, 20)           // 最新 20 条（按时间正序）
 client.MessagesBefore(ctx, sid, msgID, 20)    // msgID 之前的 20 条（向上翻页）
 client.MessagesAfter(ctx, sid, msgID, 20)     // msgID 之后的 20 条
+client.MessagesAfterSeq(ctx, sid, seq, 20)   // seq 之后的 20 条：已知游标的 Seq 时少一次按 id 查 seq 的查询（seq 写入后不变，轮询方可以记住）
 client.Message(ctx, sid, msgID)               // 单条
 ```
 

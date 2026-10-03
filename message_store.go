@@ -227,6 +227,10 @@ func messagesAfter(ctx context.Context, store Store, sessionID, messageID string
 	if err != nil {
 		return nil, err
 	}
+	return messagesAfterSeqLimit(ctx, store, sessionID, seq, limit)
+}
+
+func messagesAfterSeqLimit(ctx context.Context, store Store, sessionID string, seq int64, limit int) ([]Message, error) {
 	rows, err := store.Query(ctx, fmt.Sprintf("SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT %d", normLimit(limit)), sessionID, seq)
 	if err != nil {
 		return nil, err

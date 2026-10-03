@@ -82,6 +82,9 @@ func TestChatToolLoop(t *testing.T) {
 	if len(before) != 2 || before[0].ID != all[1].ID || len(after) != 2 || after[0].ID != all[4].ID {
 		t.Fatal("before/after")
 	}
+	if bySeq, _ := e.client.MessagesAfterSeq(ctx, a.SessionID(), all[3].Seq, 10); len(bySeq) != 2 || bySeq[0].ID != all[4].ID {
+		t.Fatal("after by seq must match after by id")
+	}
 
 	// Resume the session with a fresh agent.
 	e.llm.push(text("again"))
