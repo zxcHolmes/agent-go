@@ -51,6 +51,13 @@ type Method struct {
 	// RequireConfirm pauses the agent before running this method until the
 	// caller approves or rejects it with Agent.Confirm.
 	RequireConfirm bool
+	// Unlisted keeps the method out of the system prompt's method list. It is
+	// still registered and callable exactly like any other; the model learns
+	// about it from wherever the host documents it — typically a mounted doc
+	// (Config.Docs) that embeds MethodsDoc(...). Use it to keep a large method
+	// set from growing the system prompt: list the methods every session needs,
+	// and document the rest next to the workflow that uses them.
+	Unlisted bool
 	// Timeout overrides Config.RPCTimeout for this method (0 = inherit).
 	Timeout time.Duration
 	Handler Handler
@@ -63,6 +70,7 @@ type MethodDoc struct {
 	Result         string
 	Examples       []string
 	RequireConfirm bool
+	Unlisted       bool
 	Timeout        time.Duration
 }
 
@@ -78,6 +86,7 @@ func NewMethod[P any, R any](name string, fn func(ctx context.Context, call *Cal
 		Result:         doc.Result,
 		Examples:       doc.Examples,
 		RequireConfirm: doc.RequireConfirm,
+		Unlisted:       doc.Unlisted,
 		Timeout:        doc.Timeout,
 		Handler:        Typed(fn),
 	}

@@ -100,3 +100,41 @@ func TestNewMethodPrompt(t *testing.T) {
 		t.Fatal("want invalid example error")
 	}
 }
+
+func TestUnlistedMethod(t *testing.T) {
+	listed := NewMethod("get_order", func(ctx context.Context, c *Call, p Item) (string, error) { return p.SKU, nil },
+		MethodDoc{Description: "Read an order"})
+	hidden := NewMethod("refund_order", func(ctx context.Context, c *Call, p Item) (string, error) { return "refunded " + p.SKU, nil },
+		MethodDoc{Description: "Refund an order", Unlisted: true, RequireConfirm: true})
+	a := &Agent{cfg: Config{ToolName: "json_rpc"}, methods: map[string]Method{listed.Name: listed, hidden.Name: hidden}}
+	p, err := a.buildSystemPrompt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(p, "- `get_order`") || strings.Contains(p, "refund_order") {
+		t.Fatalf("listed must appear and unlisted must not:\n%s", p)
+	}
+	if !strings.Contains(p, "More methods than the ones below exist") {
+		t.Fatalf("the prompt should say that more methods exist:\n%s", p)
+	}
+	// Still dispatched like any method.
+	resp := a.invoke(context.Background(), &RPCCall{Method: "refund_order", Params: json.RawMessage(`{"sku":"X","qty":1}`), RPCID: json.RawMessage(`1`)})
+	if !strings.Contains(string(resp), "refunded X") {
+		t.Fatalf("unlisted method was not dispatched: %s", resp)
+	}
+	// MethodsDoc renders it the way the prompt would have.
+	doc, err := MethodsDoc(hidden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(doc, "- `refund_order`: Refund an order (requires confirmation)\n  params: {") {
+		t.Fatalf("doc:\n%s", doc)
+	}
+
+	// Nothing unlisted: no extra sentence.
+	delete(a.methods, hidden.Name)
+	p, _ = a.buildSystemPrompt()
+	if strings.Contains(p, "More methods") {
+		t.Fatal("no unlisted methods, no hint")
+	}
+}

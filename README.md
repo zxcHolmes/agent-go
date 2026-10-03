@@ -317,6 +317,22 @@ agent.NewMethod("refund_order", handler, agent.MethodDoc{
 
 说明内容是确定性生成的（方法按名称排序），不会影响前缀缓存。
 
+#### 不列进系统提示词的方法（`Unlisted`）
+
+方法多了，系统提示词会跟着变长，而很多方法只在某个流程里才用得到。`MethodDoc.Unlisted: true`（或 `Method.Unlisted`）的方法**照常注册、照常可调、参数照常校验**，只是不出现在 `## Methods` 列表里；列表开头会多一句"还有更多方法，由需要它们的文档说明"。
+
+把它的说明写进那个流程的文档（`Config.Docs`）里，用 `agent.MethodsDoc(...)` 生成，格式和系统提示词里的一模一样，说明和定义永远不会对不上：
+
+```go
+genVideo := agent.NewMethod("generate_video", handler, agent.MethodDoc{
+	Description: "生成一段视频", Unlisted: true, RequireConfirm: true,
+})
+section, err := agent.MethodsDoc(genVideo) // "- `generate_video`: 生成一段视频 (requires confirmation)\n  params: {...}\n"
+// 把 section 写进视频流程的文档；模型 read_doc 读到这份文档时才看到这个方法
+```
+
+不建议按会话切换注册的方法集合：同一个会话里调用过的方法从提示词里消失，会让历史和说明对不上，也会打断前缀缓存。只控制"列在哪里"，不控制"能不能调"。
+
 #### 其他写法
 
 ```go
