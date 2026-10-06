@@ -168,3 +168,49 @@ func TestMalformedRequestErrorsSayHowToFix(t *testing.T) {
 		t.Fatalf("got %s", out)
 	}
 }
+
+func TestValidateMode(t *testing.T) {
+	ran := false
+	confirm := NewMethod("divide", func(ctx context.Context, c *Call, p addParams) (int, error) { ran = true; return p.A / p.B, nil },
+		MethodDoc{Description: "divide", RequireConfirm: true, Validate: true})
+	plain := NewMethod("divide_now", func(ctx context.Context, c *Call, p addParams) (int, error) { ran = true; return p.A / p.B, nil },
+		MethodDoc{Description: "divide"})
+	a := &Agent{log: newLogger(Config{}), cfg: Config{ToolName: "json_rpc"}, methods: map[string]Method{"divide": confirm, "divide_now": plain}}
+	m := &Message{ID: "m"}
+	call := func(method, params string) RPCCall {
+		tc := ToolCall{ID: "t1"}
+		tc.Function.Name = "json_rpc"
+		tc.Function.Arguments = `{"jsonrpc":"2.0","id":1,"method":"` + method + `","params":` + params + `}`
+		return a.newCall(context.Background(), m, 0, tc)
+	}
+
+	// A valid call is held for confirmation as before.
+	if c := call("divide", `{"A":6,"B":3}`); c.Status != CallAwaitingConfirmation {
+		t.Fatalf("valid call: %+v", c)
+	}
+	// Validate() failing, an unknown field and a wrong type are all answered
+	// at creation with invalid params: nobody is asked to confirm them.
+	for _, params := range []string{`{"A":1,"B":0}`, `{"A":1,"C":2}`, `{"A":"x"}`} {
+		c := call("divide", params)
+		if c.Status != CallDone || c.RequireConfirm || !strings.Contains(string(c.Result), `"code":-32602`) {
+			t.Fatalf("%s: want an invalid-params answer, got %+v", params, c)
+		}
+	}
+	if c := call("divide", `{"A":1,"C":2}`); !strings.Contains(string(c.Result), "accepts only these params") {
+		t.Fatalf("decoding failure should list the accepted params: %s", c.Result)
+	}
+	// Without validate mode the call is queued and checked when it runs.
+	if c := call("divide_now", `{"A":1,"B":0}`); c.Status != CallQueued {
+		t.Fatalf("validate mode off: %+v", c)
+	}
+	if ran {
+		t.Fatal("a handler ran during call creation")
+	}
+
+	// A panicking validator lets the call through to its handler.
+	a.methods["divide"] = Method{Name: "divide", RequireConfirm: true, Handler: confirm.Handler,
+		Validate: func(context.Context, *Call) error { panic("x") }}
+	if c := call("divide", `{"A":6,"B":3}`); c.Status != CallAwaitingConfirmation {
+		t.Fatalf("panicking validator: %+v", c)
+	}
+}

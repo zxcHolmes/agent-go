@@ -188,7 +188,7 @@ func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 	return nil
 }
 
-func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
+func (a *Agent) newCall(ctx context.Context, m *Message, i int, tc ToolCall) RPCCall {
 	now := time.Now()
 	c := RPCCall{
 		ID: newID("call"), SessionID: a.sessionID, MessageID: m.ID, ToolCallID: tc.ID, Index: i,
@@ -221,6 +221,12 @@ func (a *Agent) newCall(m *Message, i int, tc ToolCall) RPCCall {
 	m2, ok := a.methods[c.Method]
 	if !ok {
 		c.Status, c.Result = CallDone, rpcErrorResponse(c.RPCID, a.methodNotFound(c.Method))
+		return c
+	}
+	// Validate mode: a call that cannot run is answered now, so it is never
+	// queued or put in front of the user for confirmation.
+	if rerr := a.validate(ctx, m2, &c); rerr != nil {
+		c.Status, c.Result = CallDone, rpcErrorResponse(c.RPCID, rerr)
 		return c
 	}
 	if m2.RequireConfirm {

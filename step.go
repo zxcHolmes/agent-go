@@ -175,7 +175,7 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 		"latency_ms", latency)
 	calls := make([]RPCCall, 0, len(msg.ToolCalls))
 	for i, tc := range msg.ToolCalls {
-		c := a.newCall(msg, i, tc)
+		c := a.newCall(ctx, msg, i, tc)
 		if err := a.createCall(ctx, st, &c); err != nil {
 			return false, err
 		}

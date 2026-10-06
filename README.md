@@ -333,6 +333,25 @@ section, err := agent.MethodsDoc(genVideo) // "- `generate_video`: 生成一段�
 
 不建议按会话切换注册的方法集合：同一个会话里调用过的方法从提示词里消失，会让历史和说明对不上，也会打断前缀缓存。只控制"列在哪里"，不控制"能不能调"。
 
+#### 调用即校验（validate 模式）
+
+默认情况下，参数在方法**执行时**才校验。对 `RequireConfirm` 的方法，这意味着一个参数写错的调用会先停下来等人确认，确认之后才报错，结果是用户面对一个根本跑不起来的确认请求。
+
+打开 validate 模式后，模型发出调用的那一刻就校验参数，不管方法要不要确认：
+
+```go
+agent.NewMethod("generate_video", handler, agent.MethodDoc{
+	Description: "生成一段视频", RequireConfirm: true,
+	Validate:    true, // 解码 params（未知字段、类型错误都拒绝），再跑 P 的 Validate() 方法
+})
+```
+
+- 校验失败的调用当场用 invalid params（-32602）答复，**不排队、不进入 `awaiting_confirmation`**。模型在下一步看到错误，自己修正后重发，没有人需要确认它。
+- 解码失败时，错误信息会附上方法接受的参数列表，和执行时报错一样。
+- 执行时 handler 照常再校验一次。
+- 手写 `Method` 时，可以直接设置 `Validate func(ctx, *Call) error`，在里面做任意检查。返回 `*RPCError` 时保留它的错误码，返回其他 error 时按 invalid params 处理。
+- 校验函数要**便宜、无副作用**，因为它在记录这一步的时候同步执行。校验函数 panic 时调用照常放行，交给 handler 处理。
+
 #### 其他写法
 
 ```go

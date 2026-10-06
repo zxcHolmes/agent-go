@@ -60,7 +60,15 @@ type Method struct {
 	Unlisted bool
 	// Timeout overrides Config.RPCTimeout for this method (0 = inherit).
 	Timeout time.Duration
-	Handler Handler
+	// Validate, when set, checks a call's params the moment the model makes
+	// it — before it is queued or held for confirmation. An error answers the
+	// call at once (an *RPCError keeps its code, any other error becomes
+	// invalid params), so the model corrects the call in its next step and a
+	// RequireConfirm method never asks anyone to confirm a call that could not
+	// run. It must be cheap and free of side effects: it runs while the step
+	// is being recorded. The handler still runs its own checks when it executes.
+	Validate func(ctx context.Context, call *Call) error
+	Handler  Handler
 }
 
 // MethodDoc is the documentation part of a Method, used by NewMethod.
@@ -72,6 +80,11 @@ type MethodDoc struct {
 	RequireConfirm bool
 	Unlisted       bool
 	Timeout        time.Duration
+	// Validate turns on validate mode: the params are decoded into P (unknown
+	// fields and wrong types refused) and P's Validate() method, if it has
+	// one, is run as soon as the model makes the call, whether or not the
+	// method requires confirmation (see Method.Validate).
+	Validate bool
 }
 
 // NewMethod builds a Method from a typed function. Params are decoded and
@@ -88,8 +101,39 @@ func NewMethod[P any, R any](name string, fn func(ctx context.Context, call *Cal
 		RequireConfirm: doc.RequireConfirm,
 		Unlisted:       doc.Unlisted,
 		Timeout:        doc.Timeout,
+		Validate:       validator[P](doc.Validate),
 		Handler:        Typed(fn),
 	}
+}
+
+// validator returns the validate-mode check for params of type P, or nil
+// when validate mode is off.
+func validator[P any](on bool) func(context.Context, *Call) error {
+	if !on {
+		return nil
+	}
+	return func(_ context.Context, call *Call) error {
+		var p P
+		if err := call.Bind(&p); err != nil {
+			return err
+		}
+		return validateParams(&p)
+	}
+}
+
+// validateParams runs P's Validate() method, declared on the value or the
+// pointer, if it has one.
+func validateParams[P any](p *P) error {
+	if v, ok := any(p).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return asInvalidParams(err)
+		}
+	} else if v, ok := any(*p).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return asInvalidParams(err)
+		}
+	}
+	return nil
 }
 
 // Call is the invocation context passed to a Handler.
@@ -145,14 +189,8 @@ func Typed[P any, R any](fn func(ctx context.Context, call *Call, params P) (R, 
 		if err := call.Bind(&p); err != nil {
 			return nil, err
 		}
-		if v, ok := any(&p).(interface{ Validate() error }); ok {
-			if err := v.Validate(); err != nil {
-				return nil, asInvalidParams(err)
-			}
-		} else if v, ok := any(p).(interface{ Validate() error }); ok {
-			if err := v.Validate(); err != nil {
-				return nil, asInvalidParams(err)
-			}
+		if err := validateParams(&p); err != nil {
+			return nil, err
 		}
 		return fn(ctx, call, p)
 	}
@@ -249,13 +287,22 @@ func rpcResultResponse(id json.RawMessage, result any) (json.RawMessage, error) 
 	}{"2.0", id, res})
 }
 
-// invoke runs the handler for a call and returns the JSON-RPC response.
-func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage) {
-	m, ok := a.methods[rec.Method]
-	if !ok {
-		return rpcErrorResponse(rec.RPCID, a.methodNotFound(rec.Method))
+// withParamsHint adds the accepted params to a decoding failure from Bind,
+// which names the bad field but not the good ones. Errors written by the
+// handler itself are left alone.
+func withParamsHint(m Method, re *RPCError) *RPCError {
+	if re.Code == CodeInvalidParams && strings.HasPrefix(re.Message, bindErrorPrefix) {
+		if hint := paramsHint(m.Params); hint != "" {
+			copied := *re
+			copied.Message += hint
+			return &copied
+		}
 	}
-	call := &Call{
+	return re
+}
+
+func (a *Agent) newCallContext(rec *RPCCall) *Call {
+	return &Call{
 		SessionID:     rec.SessionID,
 		CallID:        rec.ID,
 		ToolCallID:    rec.ToolCallID,
@@ -264,6 +311,41 @@ func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage)
 		ID:            rec.RPCID,
 		ContextParams: a.contextParams,
 	}
+}
+
+// validate runs a method's Validate on a call being created and returns the
+// error to answer it with, or nil when the call may go ahead.
+func (a *Agent) validate(ctx context.Context, m Method, rec *RPCCall) (rerr *RPCError) {
+	if m.Validate == nil {
+		return nil
+	}
+	call := a.newCallContext(rec)
+	defer func() {
+		if r := recover(); r != nil {
+			// A broken validator must not block the method: let the call
+			// through and leave the checking to its handler.
+			a.log.Error("rpc validator panicked", "session", a.sessionID, "method", rec.Method, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			rerr = nil
+		}
+	}()
+	err := m.Validate(context.WithValue(ctx, callKey{}, call), call)
+	if err == nil {
+		return nil
+	}
+	var re *RPCError
+	if !errors.As(err, &re) {
+		re = InvalidParams("%s", err.Error())
+	}
+	return a.limitError(withParamsHint(m, re))
+}
+
+// invoke runs the handler for a call and returns the JSON-RPC response.
+func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage) {
+	m, ok := a.methods[rec.Method]
+	if !ok {
+		return rpcErrorResponse(rec.RPCID, a.methodNotFound(rec.Method))
+	}
+	call := a.newCallContext(rec)
 	defer func() {
 		if r := recover(); r != nil {
 			// The stack goes to the log only: it is noise for the model and
@@ -278,16 +360,7 @@ func (a *Agent) invoke(ctx context.Context, rec *RPCCall) (resp json.RawMessage)
 		if !errors.As(err, &re) {
 			re = &RPCError{Code: CodeInternalError, Message: err.Error()}
 		}
-		// A decoding failure from Bind names the bad field but not the good
-		// ones; add them. Errors written by the handler itself are left alone.
-		if re.Code == CodeInvalidParams && strings.HasPrefix(re.Message, bindErrorPrefix) {
-			if hint := paramsHint(m.Params); hint != "" {
-				copied := *re
-				copied.Message += hint
-				re = &copied
-			}
-		}
-		return rpcErrorResponse(rec.RPCID, a.limitError(re))
+		return rpcErrorResponse(rec.RPCID, a.limitError(withParamsHint(m, re)))
 	}
 	out, err := rpcResultResponse(rec.RPCID, a.limitResult(result))
 	if err != nil {

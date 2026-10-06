@@ -141,7 +141,7 @@ func (a *Agent) reconcileCalls(ctx context.Context, st *runState) error {
 	for i, tc := range msg.ToolCalls {
 		c := byIndex[i]
 		if c == nil {
-			nc := a.newCall(msg, i, tc)
+			nc := a.newCall(ctx, msg, i, tc)
 			if err := a.createCall(ctx, st, &nc); err != nil {
 				return err
 			}
