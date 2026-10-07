@@ -94,6 +94,8 @@ settlement. User-facing docs are in `README.md` (Chinese).
 - `agent.go` — `Agent` construction and public run methods (Chat, ChatMessage,
   Continue, Confirm, Enqueue).
 - `run.go` — run lifecycle: acquire, heal, finish.
+- `activity.go` — `Client.Activity`: store-wide snapshot (running / stale /
+  waiting counts, recent sessions) for "can we restart now?". Fixed 3 queries.
 - `monitor.go` — per-Client batched heartbeat and cross-process stop poll
   (one UPDATE / one SELECT per interval for all runs, never one per run).
 - `lock.go` — session lock (acquire/checkpoint/release).

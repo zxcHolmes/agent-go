@@ -169,6 +169,7 @@ client.ResetSession(ctx, sid)                          // 手动恢复单个会�
 client.ResetContext(ctx, sid)                          // 手动重置上下文：之前的消息不再发给模型，历史保留（见“上下文压缩”）
 client.DeleteSession(ctx, sid)                         // 删除会话（见下文）
 client.Recover(ctx)                                    // 重新执行一次启动时的崩溃恢复
+client.Activity(ctx, agent.ActivityOptions{Limit: 50}) // 全库运行概况：正在跑几个、哪些会话最近活跃（见“运行概况”）
 ```
 
 **删除会话**：`client.DeleteSession` 会永久删除会话本身、所有消息、RPC 调用记录和队列消息。token 用量和计费记录（`agent_llm_calls`）会**保留**：它们只包含 token 数和积分，不含对话内容，保留下来是为了让未结算的用量仍然可以结算。运行中或停止中的会话会返回 `ErrBusy`，需要先 `Stop` 并等会话变为 `idle`；会话不存在时返回 `ErrSessionNotFound`。SDK 不提供按用户查询会话的功能，session id 由调用方自己保存。
@@ -574,6 +575,23 @@ agent.NewClient(ctx, agent.Config{
 ```
 
 另外，每次运行开始时也会自动修复该会话的残留状态（接管无心跳的会话时同样适用），所以即使进程没有重启，也不会出现历史不完整的情况。
+
+### 运行概况（什么时候可以重启）
+
+`client.Activity` 读整个存储（所有会话、所有进程）的当前状态，回答“现在重启/发版会不会打断正在跑的 agent”。只读，固定 3 条查询，与会话数量无关：
+
+```go
+act, _ := client.Activity(ctx, agent.ActivityOptions{Limit: 50})
+act.Running             // running / stopping 且心跳还在：某个进程正在执行，重启会打断它
+act.Stale               // 仍标记 running / stopping 但心跳超过 Config.StaleAfter：进程已经没了，没有东西在执行
+act.WaitingConfirmation // 停在等待确认，没有运行中的 run
+act.QueuedMessages      // 还没进入对话的排队消息
+act.Sessions            // 非 idle 的排前面，其余按 updated_at 倒序，最多 Limit 条（默认 50，上限 500）
+```
+
+`Sessions` 每项是 `Session` 加上 `Stale` 和 `LastMessageAt`（最新一条消息的写入时间，没有消息时为零值）。运行中 `UpdatedAt` 是心跳时间，所以显示“最近活动”应该用 `LastMessageAt`。会话属于谁由调用方从 `Metadata` 里读。
+
+`Running == 0` 就可以重启。即使重启时有运行中的会话，下次启动 `NewClient` 也会按上节恢复，只是正在执行的那次调用结果未知，需要用户点继续。
 
 ### Token 记录与计费
 
