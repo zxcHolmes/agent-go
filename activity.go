@@ -24,8 +24,10 @@ type Activity struct {
 	// QueuedMessages counts user messages not yet added to a conversation
 	// (waiting, or claimed by a run that has not written them yet).
 	QueuedMessages int `json:"queued_messages"`
-	// Sessions lists sessions that are not idle first, then the most recently
-	// updated, up to ActivityOptions.Limit.
+	// Total counts every session in the store, for paging Sessions.
+	Total int `json:"total"`
+	// Sessions is one page of sessions: those not idle first, then the most
+	// recently updated (ActivityOptions.Limit / Offset).
 	Sessions []SessionActivity `json:"sessions"`
 	// CheckedAt is when the snapshot was taken, by this process's clock.
 	CheckedAt time.Time `json:"checked_at"`
@@ -48,6 +50,8 @@ type ActivityOptions struct {
 	// Limit caps Activity.Sessions (default 50, max 500). The counts always
 	// cover every session.
 	Limit int
+	// Offset skips that many sessions of the ordering, for paging.
+	Offset int
 }
 
 // Activity reports how many runs are in flight across the store and lists the
@@ -60,6 +64,10 @@ func (c *Client) Activity(ctx context.Context, opts ActivityOptions) (*Activity,
 	} else if limit > 500 {
 		limit = 500
 	}
+	offset := opts.Offset
+	if offset < 0 {
+		offset = 0
+	}
 	now := time.Now()
 	staleBefore := now.Add(-c.cfg.StaleAfter).UnixMilli()
 	out := &Activity{CheckedAt: now, Sessions: []SessionActivity{}}
@@ -67,17 +75,18 @@ func (c *Client) Activity(ctx context.Context, opts ActivityOptions) (*Activity,
 	rows, err := c.store.Query(ctx, `SELECT
 		COALESCE(SUM(CASE WHEN status IN (?, ?) AND updated_at >= ? THEN 1 ELSE 0 END), 0) AS running,
 		COALESCE(SUM(CASE WHEN status IN (?, ?) AND updated_at < ? THEN 1 ELSE 0 END), 0) AS stale,
-		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS waiting
-		FROM agent_sessions WHERE status <> ?`,
+		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS waiting,
+		COUNT(*) AS sessions
+		FROM agent_sessions`,
 		string(StatusRunning), string(StatusStopping), staleBefore,
 		string(StatusRunning), string(StatusStopping), staleBefore,
-		string(StatusWaitingConfirmation), string(StatusIdle))
+		string(StatusWaitingConfirmation))
 	if err != nil {
 		return nil, fmt.Errorf("agent: activity counts: %w", err)
 	}
-	var running, stale, waiting int64
+	var running, stale, waiting, total int64
 	if rows.Next() {
-		err = rows.Scan(&running, &stale, &waiting)
+		err = rows.Scan(&running, &stale, &waiting, &total)
 	}
 	if err == nil {
 		err = rows.Err()
@@ -86,7 +95,7 @@ func (c *Client) Activity(ctx context.Context, opts ActivityOptions) (*Activity,
 	if err != nil {
 		return nil, fmt.Errorf("agent: activity counts: %w", err)
 	}
-	out.Running, out.Stale, out.WaitingConfirmation = int(running), int(stale), int(waiting)
+	out.Running, out.Stale, out.WaitingConfirmation, out.Total = int(running), int(stale), int(waiting), int(total)
 
 	rows, err = c.store.Query(ctx, "SELECT COUNT(*) AS queued FROM agent_queued_messages WHERE status IN (?, ?)",
 		queueWaiting, queueTaken)
@@ -112,7 +121,7 @@ func (c *Client) Activity(ctx context.Context, opts ActivityOptions) (*Activity,
 		COALESCE((SELECT m.updated_at FROM agent_messages m WHERE m.session_id = s.id ORDER BY m.seq DESC LIMIT 1), 0) AS last_message_at
 		FROM agent_sessions s
 		ORDER BY CASE WHEN s.status = ? THEN 1 ELSE 0 END, s.updated_at DESC, s.id
-		LIMIT ?`, string(StatusIdle), limit)
+		LIMIT ? OFFSET ?`, string(StatusIdle), limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("agent: activity sessions: %w", err)
 	}

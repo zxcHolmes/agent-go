@@ -44,7 +44,7 @@ func TestActivity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if act.Running != 1 || act.Stale != 0 || act.WaitingConfirmation != 0 || act.QueuedMessages != 1 {
+	if act.Running != 1 || act.Stale != 0 || act.WaitingConfirmation != 0 || act.QueuedMessages != 1 || act.Total != 2 {
 		t.Fatalf("while running: %+v", act)
 	}
 	if len(act.Sessions) != 2 || act.Sessions[0].ID != busy.SessionID() || act.Sessions[0].Status != agent.StatusRunning || act.Sessions[0].Stale {
@@ -67,7 +67,16 @@ func TestActivity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if act.Running != 0 || act.Stale != 1 || len(act.Sessions) != 1 || !act.Sessions[0].Stale || act.Sessions[0].ID != idle.SessionID() {
+	if act.Running != 0 || act.Stale != 1 || act.Total != 2 || len(act.Sessions) != 1 || !act.Sessions[0].Stale || act.Sessions[0].ID != idle.SessionID() {
 		t.Fatalf("stale: %+v", act)
+	}
+	// The second page holds the other session; past the end is empty.
+	act, err = e.client.Activity(ctx, agent.ActivityOptions{Limit: 1, Offset: 1})
+	if err != nil || len(act.Sessions) != 1 || act.Sessions[0].ID != busy.SessionID() {
+		t.Fatalf("page 2: %+v %v", act, err)
+	}
+	act, err = e.client.Activity(ctx, agent.ActivityOptions{Limit: 1, Offset: 2})
+	if err != nil || len(act.Sessions) != 0 || act.Total != 2 {
+		t.Fatalf("past the end: %+v %v", act, err)
 	}
 }
