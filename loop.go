@@ -207,7 +207,7 @@ func (a *Agent) newCall(ctx context.Context, m *Message, i int, tc ToolCall, loa
 	}
 	if tc.Function.Name != a.cfg.ToolName || len(a.methods) == 0 {
 		c.Status = CallDone
-		c.Result = rpcErrorResponse(nil, &RPCError{Code: CodeMethodNotFound, Message: fmt.Sprintf("unknown tool %q; available tools: %s", tc.Function.Name, strings.Join(a.toolNames(), ", "))})
+		c.Result = rpcErrorResponse(nil, a.unknownToolError(tc.Function.Name))
 		return c
 	}
 	req, rerr := parseRPCRequest(tc.Function.Arguments)
@@ -235,6 +235,23 @@ func (a *Agent) newCall(ctx context.Context, m *Message, i int, tc ToolCall, loa
 		c.RequireConfirm, c.Status = true, CallAwaitingConfirmation
 	}
 	return c
+}
+
+// unknownToolError answers a call to a tool that does not exist. When the
+// name is one of the RPC methods, the model called a method as if it were a
+// tool: nothing runs, and the error says exactly how to call it, so the model
+// corrects itself on its next step instead of telling the user the method is
+// unavailable.
+func (a *Agent) unknownToolError(name string) *RPCError {
+	if _, ok := a.methods[name]; ok && a.cfg.ToolName != "" {
+		return &RPCError{Code: CodeMethodNotFound, Message: fmt.Sprintf(
+			"%q is not a tool: it is a method of the %s tool, and calling it as a tool did nothing. "+
+				"Call it again now through %s, with your arguments as params: "+
+				`{"jsonrpc":"2.0","method":%q,"params":{...the same arguments...},"id":1}. `+
+				"Every method is called this way; the only tools are %s.",
+			name, a.cfg.ToolName, a.cfg.ToolName, name, strings.Join(a.toolNames(), ", "))}
+	}
+	return &RPCError{Code: CodeMethodNotFound, Message: fmt.Sprintf("unknown tool %q; available tools: %s", name, strings.Join(a.toolNames(), ", "))}
 }
 
 func (a *Agent) toolNames() []string {

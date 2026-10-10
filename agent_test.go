@@ -214,3 +214,25 @@ func TestValidateMode(t *testing.T) {
 		t.Fatalf("panicking validator: %+v", c)
 	}
 }
+
+// A method called as if it were a tool is not run; the answer says how to call
+// it through the RPC tool, so the model can correct itself.
+func TestMethodCalledAsToolIsBouncedWithHowTo(t *testing.T) {
+	ran := false
+	m := NewMethod("ask_user", func(ctx context.Context, c *Call, p addParams) (int, error) { ran = true; return 0, nil }, MethodDoc{Description: "ask"})
+	a := &Agent{log: newLogger(Config{}), cfg: Config{ToolName: "json_rpc"}, methods: map[string]Method{"ask_user": m}}
+	call := func(name string) RPCCall {
+		tc := ToolCall{ID: "t1"}
+		tc.Function.Name, tc.Function.Arguments = name, `{"A":1}`
+		return a.newCall(context.Background(), &Message{ID: "m"}, 0, tc, nil)
+	}
+	c := call("ask_user")
+	res := string(c.Result)
+	if c.Status != CallDone || ran || !strings.Contains(res, "is not a tool: it is a method of the json_rpc tool") || !strings.Contains(res, `\"method\":\"ask_user\"`) {
+		t.Fatalf("method called as a tool: status %s ran %v result %s", c.Status, ran, res)
+	}
+	// Any other unknown name keeps the plain answer.
+	if c := call("nope"); !strings.Contains(string(c.Result), `unknown tool \"nope\"`) {
+		t.Fatalf("unknown tool: %s", c.Result)
+	}
+}
