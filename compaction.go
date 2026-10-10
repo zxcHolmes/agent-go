@@ -9,10 +9,13 @@ import (
 	"time"
 )
 
-const defaultCompactionPrompt = "You are compacting a conversation between a user and an AI assistant so that it fits in a limited context window. " +
-	"Write concise notes the assistant can rely on to continue the conversation. Preserve the user's goals and preferences, " +
-	"key facts, names, ids and numbers, decisions taken, results of tool calls, and any unfinished tasks. " +
-	"Write only the notes, no preamble."
+// defaultCompactionRequest is the user message appended to the context when
+// the model writes its own notes (see summarize).
+const defaultCompactionRequest = "Context checkpoint: everything above is about to be removed from your context. " +
+	"Only your notes and the latest user request, with what follows it, will remain. " +
+	"Write the notes you need to continue: the user's goals and preferences, key facts, names, and every id, URL and number still needed, copied exactly; " +
+	"decisions taken, results of tool calls, and any unfinished tasks. " +
+	"Do not call any tool and do not address the user. Write only the notes."
 
 // prepareContext returns the messages to send and the output token budget,
 // compacting the history first when it has grown past the threshold.
@@ -26,7 +29,7 @@ func (a *Agent) prepareContext(ctx context.Context, st *runState) (window []Mess
 	}
 	if a.needsCompaction(est) {
 		before := est
-		compacted, err := a.compact(ctx, st, window, marker)
+		compacted, err := a.compact(ctx, st, window, marker, est)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -159,7 +162,7 @@ func (a *Agent) outputBudget(est int) (int, error) {
 // and records a compaction message; in summary mode the dropped messages are
 // summarized first. It reports false when there is nothing to drop (the
 // current turn already starts the window).
-func (a *Agent) compact(ctx context.Context, st *runState, window []Message, marker *Message) (bool, error) {
+func (a *Agent) compact(ctx context.Context, st *runState, window []Message, marker *Message, est int) (bool, error) {
 	var anchor *Message
 	for i := len(window) - 1; i >= 0; i-- {
 		if m := window[i]; m.Role == "user" && m.Kind == "" {
@@ -177,13 +180,6 @@ func (a *Agent) compact(ctx context.Context, st *runState, window []Message, mar
 	if anchor == nil || anchor.Seq <= firstSeq {
 		return false, nil
 	}
-	var dropped []Message
-	for _, m := range window {
-		if m.Seq < anchor.Seq || m.Kind == MessageKindCompaction {
-			dropped = append(dropped, m)
-		}
-	}
-
 	m := Message{
 		ID: newID("msg"), SessionID: a.sessionID, Kind: MessageKindCompaction, RefSeq: anchor.Seq,
 		Status: MessageExcluded, CreatedAt: time.Now(), UpdatedAt: time.Now(),
@@ -191,7 +187,7 @@ func (a *Agent) compact(ctx context.Context, st *runState, window []Message, mar
 	note := fmt.Sprintf("Context compacted: messages before #%d are no longer sent to the model.", anchor.Seq)
 	var rec *UsageRecord
 	if a.cfg.Compaction == CompactionSummary {
-		summary, r, err := a.summarize(ctx, st, dropped, m.ID)
+		summary, r, err := a.summarize(ctx, st, window, est, m.ID)
 		if err != nil {
 			var rej *rejectedError
 			if errors.As(err, &rej) {
@@ -227,38 +223,59 @@ func (a *Agent) compact(ctx context.Context, st *runState, window []Message, mar
 	return true, nil
 }
 
-// summarize asks the model for notes on the dropped messages.
-func (a *Agent) summarize(ctx context.Context, st *runState, dropped []Message, messageID string) (string, *UsageRecord, error) {
-	prompt := a.cfg.CompactionPrompt
-	if prompt == "" {
-		prompt = defaultCompactionPrompt
+// summaryMaxTokens caps the notes a summary call may write.
+const summaryMaxTokens = 4096
+
+// summarize asks the model for notes on what compaction drops.
+//
+// It sends the request the next step would send — same system prompt, tools
+// and history, byte for byte — with one user message appended asking for
+// notes. That prefix is what the provider has cached, so the call pays for the
+// instruction and the notes, not the whole context again. The instruction is
+// a user message, not a second system message: many chat templates refuse a
+// system message anywhere but first. ContextLength is the host's budget, not
+// the model's limit, so the request is not checked against it; if the
+// provider does refuse it, compaction goes ahead without notes (see compact).
+func (a *Agent) summarize(ctx context.Context, st *runState, window []Message, est int, messageID string) (string, *UsageRecord, error) {
+	request := a.cfg.CompactionPrompt
+	if request == "" {
+		request = defaultCompactionRequest
 	}
-	maxTokens := a.cfg.ContextLength / 4
-	if maxTokens > 2048 {
-		maxTokens = 2048
+	ask, err := userRaw(request)
+	if err != nil {
+		return "", nil, err
 	}
-	// Same ~3 bytes/token estimate as the rest of the SDK, leaving room for
-	// the instructions and the summary itself.
-	budget := (a.cfg.ContextLength - maxTokens - len(prompt)/3 - 200) * 3
-	system, _ := marshalJSON(map[string]string{"role": "system", "content": prompt})
-	user, _ := userRaw("Conversation to summarize:\n\n" + transcript(dropped, budget))
-	req := chatRequest{Model: a.cfg.Model, Messages: []json.RawMessage{system, user}}
+	msgs := make([]json.RawMessage, 0, len(window)+2)
+	if a.system != nil {
+		msgs = append(msgs, a.system)
+	}
+	for _, m := range window {
+		msgs = append(msgs, m.Raw)
+	}
+	msgs = append(msgs, ask)
+	if a.cfg.CacheControl {
+		msgs = withCacheControl(msgs)
+	}
+	// The tools stay in the request: they are part of the cached prefix.
+	req := chatRequest{Model: a.cfg.Model, Messages: msgs, Tools: a.tools}
+	return a.summaryCall(ctx, req, est+len(ask)/3, summaryMaxTokens, messageID)
+}
+
+// summaryCall sends one summary request and records its usage against the
+// compaction message.
+func (a *Agent) summaryCall(ctx context.Context, req chatRequest, est, maxTokens int, messageID string) (string, *UsageRecord, error) {
 	if a.cfg.UseMaxCompletionTokens {
 		req.MaxCompletionTokens = maxTokens
 	} else {
 		req.MaxTokens = maxTokens
 	}
-	if err := a.beforeLLMCall(ctx, "summary", (len(system)+len(user))/3, maxTokens); err != nil {
+	if err := a.beforeLLMCall(ctx, "summary", est, maxTokens); err != nil {
 		return "", nil, &rejectedError{err}
 	}
 	start := time.Now()
 	res, err := a.llm.stream(ctx, req, a.cfg.ExtraBody, nil)
 	if err != nil {
 		return "", nil, err
-	}
-	summary := strings.TrimSpace(res.Content)
-	if summary == "" {
-		return "", nil, fmt.Errorf("agent: empty summary")
 	}
 	usage := parseUsage(res.Usage)
 	rec := &UsageRecord{
@@ -269,47 +286,11 @@ func (a *Agent) summarize(ctx context.Context, st *runState, dropped []Message, 
 	if a.cfg.Billing != nil {
 		rec.Cost = a.cfg.Billing.Cost(a.cfg.Model, usage)
 	}
+	summary := strings.TrimSpace(res.Content)
+	if summary == "" {
+		return "", nil, fmt.Errorf("agent: empty summary")
+	}
+	a.log.Debug("summary written", "session", a.sessionID, "prompt_tokens", usage.PromptTokens,
+		"cached_tokens", usage.CachedTokens, "completion_tokens", usage.CompletionTokens)
 	return summary, rec, nil
-}
-
-// transcript renders messages as plain text for summarization within
-// maxBytes. Long messages are trimmed individually first so every turn stays
-// represented; if it is still too long, the middle is cut, keeping the start
-// (earlier notes, first facts) and the most recent part.
-func transcript(msgs []Message, maxBytes int) string {
-	var parts []string
-	for _, m := range msgs {
-		clip := func(s string, n int) string {
-			if cut, dropped := truncateRunes(s, n); dropped > 0 {
-				return cut + fmt.Sprintf("…[%d characters omitted]", dropped)
-			}
-			return s
-		}
-		var p string
-		switch {
-		case m.Kind == MessageKindCompaction:
-			p = "Earlier notes:\n" + m.Content
-		case m.Kind == MessageKindViewImage:
-			p = "[image shown to the assistant: " + m.Content + "]"
-		case m.Role == "user":
-			p = "User: " + clip(m.Content, 2000)
-		case m.Role == "assistant":
-			p = "Assistant: " + clip(m.Content, 1200)
-			for _, tc := range m.ToolCalls {
-				p += "\n[called " + tc.Function.Name + " " + clip(tc.Function.Arguments, 300) + "]"
-			}
-		case m.Role == "tool":
-			p = "[tool result: " + clip(m.Content, 800) + "]"
-		default:
-			continue
-		}
-		parts = append(parts, p)
-	}
-	s := strings.Join(parts, "\n\n")
-	if maxBytes <= 0 || len(s) <= maxBytes {
-		return s
-	}
-	const gap = "\n\n…(middle of the conversation omitted)…\n\n"
-	head, tail := maxBytes*3/10, maxBytes*7/10-len(gap)
-	return strings.ToValidUTF8(s[:head], "") + gap + strings.ToValidUTF8(s[len(s)-tail:], "")
 }

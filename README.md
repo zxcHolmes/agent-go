@@ -689,7 +689,7 @@ agent.Config{
 | `Config.Compaction` | 行为 |
 | --- | --- |
 | `agent.CompactionAnchor`（默认） | **固定上个用户消息起点**：把起点移到最近一条用户消息，之前的消息不再发给模型。压缩消息只是给前端看的分隔标记（`status = excluded`） |
-| `agent.CompactionSummary` | 先让模型把要丢弃的部分总结成笔记（这次调用照常计费），笔记以 `<conversation_summary>` 用户消息的形式放在最前面，后面接最近一条用户消息及之后的内容 |
+| `agent.CompactionSummary` | 先让模型把要丢弃的部分总结成笔记（这次调用照常计费），笔记以 `<conversation_summary>` 用户消息的形式放在最前面，后面接最近一条用户消息及之后的内容。写笔记的请求就是下一步本来要发的请求（系统提示词、tools、历史逐字节相同）末尾追加一条要求写笔记的用户消息，所以**命中前缀缓存**，只多付这条指令和笔记的钱 |
 | `agent.CompactionOff` | 不压缩，放不下时返回 `ErrContextLengthExceeded` |
 
 ```go
@@ -697,14 +697,14 @@ agent.Config{
 	ContextLength:       100000,
 	Compaction:          agent.CompactionSummary, // 默认 CompactionAnchor
 	CompactionThreshold: 0.8,
-	CompactionPrompt:    "……",                    // 可选：自定义摘要要求
+	CompactionPrompt:    "……",                    // 可选：自定义摘要要求（追加的那条用户消息）
 }
 ```
 
 - **起点不是固定条数**：起点只在压缩的那一刻移动，两次压缩之间发送的历史开头完全不变，**前缀缓存持续有效**。实测一次对话中，每轮都命中了上一轮几乎全部的 prompt。
 - 起点总是用户消息，工具调用和结果的配对不会被截断。
 - 如果当前这一轮本身（从最近一条用户消息开始）已经太大，就没有可以丢弃的内容，会继续执行直到放不下（`ErrContextLengthExceeded`）。运行中用“消息队列”追加的用户消息也可以作为新的起点。
-- 摘要模式下，交给模型总结的对话会按 token 预算截取：每条长消息先单独截短，仍然超长时去掉中间部分，保留开头（上一次的摘要、最早的关键信息）和结尾。
+- 摘要请求的指令是一条**用户消息**，不是对话中间的 system 消息：很多模型的 chat template 要求 system 只能在第一条。`ContextLength` 是你设的预算，不是模型的真实上限，所以摘要请求不按它检查（压缩在阈值触发，通常还有余量）；万一 provider 拒绝或调用失败，就不写笔记，只移动起点（等同 anchor），对话不会中断。
 
 实测（`ContextLength: 5000`，每轮约 600 token 的长回答）：prompt 从 62 增长到 3786 token 后触发压缩，下一次请求降到 37 token（anchor 模式）或 224 token（summary 模式，模型依然记得最开始告诉它的暗号）。
 

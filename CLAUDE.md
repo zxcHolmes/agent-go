@@ -82,6 +82,14 @@ settlement. User-facing docs are in `README.md` (Chinese).
   summary, written under the session lock (acquired from idle only, healed
   first like a run). Never insert a marker outside the lock: landing mid-turn
   would split an assistant's `tool_calls` from their tool messages.
+- A summary is written IN CONTEXT: the step's own request (system, tools,
+  history byte for byte) plus one appended user message asking for notes, so
+  the provider's prefix cache hits. Never give it its own system prompt or
+  drop the tools — that re-reads the whole context uncached. The request is a
+  USER message (a mid-conversation system message breaks many chat
+  templates). It is not checked against ContextLength (a host budget, not
+  the model's limit). Failed / no text → compact without notes; there is no
+  transcript fallback.
 - After a compaction, the last LLM call's token count no longer describes the
   window (`estimateTokens` checks this); usage rows of summary calls point at the
   compaction message, not an assistant message.

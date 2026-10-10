@@ -100,13 +100,23 @@ func TestCompactionSummary(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The summarizer saw the dropped messages as a transcript, with no tools.
-	sum := e.llm.request(2)
-	if len(sum) != 2 || !strings.Contains(string(sum[1]), "User: a") || !strings.Contains(string(sum[1]), "Assistant: B") {
-		t.Fatalf("summary request: %s", sum)
+	// The summary request is the step's own request — system prompt, tools
+	// and history byte for byte, so the provider's prefix cache hits — with
+	// one user message appended asking for notes.
+	prev, sum := e.llm.request(1), e.llm.request(2)
+	if len(sum) != len(prev)+3 { // + B, c, the request
+		t.Fatalf("summary request: %v", requestShape(sum))
 	}
-	if _, ok := e.llm.requests[2]["tools"]; ok {
-		t.Fatal("summary request must not offer tools")
+	for i := range prev {
+		if !bytes.Equal(prev[i], sum[i]) {
+			t.Fatalf("summary request changed the prefix at %d", i)
+		}
+	}
+	if got := requestShape(sum); got[len(got)-2] != "user:c" || !strings.HasPrefix(got[len(got)-1], "user:Context checkpoint") {
+		t.Fatalf("summary request: %v", got)
+	}
+	if !bytes.Equal(e.llm.requests[1]["tools"], e.llm.requests[2]["tools"]) {
+		t.Fatal("summary request must keep the tools (they are part of the cached prefix)")
 	}
 	// The main request carries the summary, then the current turn.
 	got := requestShape(e.llm.request(3))
