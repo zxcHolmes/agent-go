@@ -141,7 +141,7 @@ func (a *Agent) buildReadDocTool() (json.RawMessage, error) {
 		"type": "function",
 		"function": map[string]any{
 			"name":        ReadDocTool,
-			"description": "Read one of the documents listed in the system prompt, by its exact title. Start with page 1 (the default): most documents have a single page, and the result says explicitly when there are more pages.",
+			"description": "Read one of the documents listed in the system prompt, by its exact title. Start with page 1 (the default): most documents have a single page, and the result says explicitly when there are more pages. A document you already read in this conversation is not sent again while it is unchanged: the result then says it is already loaded, and you use the earlier copy.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -186,11 +186,66 @@ func (a *Agent) docsPromptSection() string {
 	return b.String()
 }
 
+// loadedDocs is what the model can already see of the mounted documents: for
+// each (title, page), the text of the latest read_doc result in the context
+// window this step sends, plus the results answered earlier in the same turn.
+// Compaction drops old results from the window, so a document read before a
+// compaction is sent again in full.
+type loadedDocs map[docPage]string
+
+type docPage struct {
+	title string // lower-cased
+	page  int
+}
+
+// Lines read_doc puts right under a result's "# Title" heading.
+const (
+	docAlreadyLoaded = "(Already loaded: this document is unchanged since your earlier read_doc call, whose result is still in this conversation. Use that copy; it is not sent again.)"
+	docChanged       = "(This document changed since you last read it. This is the current version; it replaces the earlier copy.)"
+)
+
+// loadedDocsIn collects the read_doc results in a context window. A result is
+// matched to its call through the assistant message's tool calls, so only
+// real read_doc answers count, never text that merely looks like one.
+func (a *Agent) loadedDocsIn(window []Message) loadedDocs {
+	l := loadedDocs{}
+	if !a.hasDocs() {
+		return l
+	}
+	asked := map[string]docPage{} // tool call id → what it asked for
+	for _, m := range window {
+		d := decodeMessage(m.Raw)
+		switch d.Role {
+		case "assistant":
+			for _, tc := range d.ToolCalls {
+				if tc.Function.Name != ReadDocTool {
+					continue
+				}
+				if doc, page, ok := a.docArgs(tc.Function.Arguments); ok {
+					asked[tc.ID] = docPage{strings.ToLower(doc.Title), page}
+				}
+			}
+		case "tool":
+			key, ok := asked[d.ToolCallID]
+			if !ok || !strings.HasPrefix(d.Content, "# ") {
+				continue // not a read_doc call, or an error answer
+			}
+			if _, rest, _ := strings.Cut(d.Content, "\n"); strings.HasPrefix(rest, docAlreadyLoaded) {
+				continue // a pointer to an earlier copy, not a copy
+			}
+			l[key] = strings.Replace(d.Content, "\n"+docChanged, "", 1)
+		}
+	}
+	return l
+}
+
 // newReadDocCall answers a read_doc call right away (reading a file needs no
-// confirmation). The result is plain text, stored as a JSON string.
-func (a *Agent) newReadDocCall(c *RPCCall, arguments string) {
+// confirmation). The result is plain text, stored as a JSON string. With
+// loaded (nil disables it), a document the model already has, unchanged, is
+// answered with a short note instead of its text.
+func (a *Agent) newReadDocCall(c *RPCCall, arguments string, loaded loadedDocs) {
 	c.Method, c.Status = ReadDocTool, CallDone
-	text := a.readDoc(arguments)
+	text := a.readDoc(arguments, loaded)
 	c.Params = json.RawMessage(arguments)
 	if !json.Valid(c.Params) {
 		c.Params, _ = marshalJSON(arguments)
@@ -198,7 +253,23 @@ func (a *Agent) newReadDocCall(c *RPCCall, arguments string) {
 	c.Result, _ = marshalJSON(text)
 }
 
-func (a *Agent) readDoc(arguments string) string {
+// docArgs resolves read_doc arguments to a mounted document and a page (1 when omitted).
+func (a *Agent) docArgs(arguments string) (*Doc, int, bool) {
+	var args struct {
+		Title string `json:"title"`
+		Page  int    `json:"page"`
+	}
+	if json.Unmarshal([]byte(arguments), &args) != nil {
+		return nil, 0, false
+	}
+	doc := a.res.byTitle[strings.ToLower(strings.TrimSpace(args.Title))]
+	if args.Page <= 0 {
+		args.Page = 1
+	}
+	return doc, args.Page, doc != nil
+}
+
+func (a *Agent) readDoc(arguments string, loaded loadedDocs) string {
 	var args struct {
 		Title string `json:"title"`
 		Page  int    `json:"page"`
@@ -231,7 +302,21 @@ func (a *Agent) readDoc(arguments string) string {
 		}
 		head += ")\n"
 	}
-	return head + "\n" + pages[page-1]
+	text := head + "\n" + pages[page-1]
+	if loaded == nil {
+		return text
+	}
+	key := docPage{strings.ToLower(doc.Title), page}
+	prev, seen := loaded[key]
+	loaded[key] = text
+	switch {
+	case !seen:
+		return text
+	case prev == text:
+		return "# " + doc.Title + "\n" + docAlreadyLoaded
+	default:
+		return "# " + doc.Title + "\n" + docChanged + strings.TrimPrefix(text, "# "+doc.Title)
+	}
 }
 
 // splitPages cuts text into pages of at most size characters, preferring to

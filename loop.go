@@ -188,7 +188,9 @@ func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 	return nil
 }
 
-func (a *Agent) newCall(ctx context.Context, m *Message, i int, tc ToolCall) RPCCall {
+// loaded is what the model already has of the mounted documents (see
+// loadedDocs); nil sends every read_doc result in full.
+func (a *Agent) newCall(ctx context.Context, m *Message, i int, tc ToolCall, loaded loadedDocs) RPCCall {
 	now := time.Now()
 	c := RPCCall{
 		ID: newID("call"), SessionID: a.sessionID, MessageID: m.ID, ToolCallID: tc.ID, Index: i,
@@ -196,7 +198,7 @@ func (a *Agent) newCall(ctx context.Context, m *Message, i int, tc ToolCall) RPC
 	}
 	fallbackID, _ := marshalJSON(tc.ID)
 	if a.hasDocs() && tc.Function.Name == ReadDocTool {
-		a.newReadDocCall(&c, tc.Function.Arguments)
+		a.newReadDocCall(&c, tc.Function.Arguments, loaded)
 		return c
 	}
 	if a.cfg.ViewImage && tc.Function.Name == ViewImageTool {

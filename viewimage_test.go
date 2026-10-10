@@ -13,13 +13,13 @@ func TestViewImageCall(t *testing.T) {
 	tc.Function.Name = ViewImageTool
 
 	tc.Function.Arguments = `{"url":"https://cdn.example.com/a.png"}`
-	c := a.newCall(context.Background(), m, 0, tc)
+	c := a.newCall(context.Background(), m, 0, tc, nil)
 	if u, ok := viewImageURL(&c); !ok || u != "https://cdn.example.com/a.png" || c.Status != CallDone {
 		t.Fatalf("%+v", c)
 	}
 	for _, bad := range []string{`{"url":"file:///etc/passwd"}`, `{"url":""}`, `{"url":"data:image/png;base64,xx"}`, `not json`} {
 		tc.Function.Arguments = bad
-		c := a.newCall(context.Background(), m, 0, tc)
+		c := a.newCall(context.Background(), m, 0, tc, nil)
 		if _, ok := viewImageURL(&c); ok || !strings.Contains(string(c.Result), `"ok":false`) {
 			t.Fatalf("%s accepted: %s", bad, c.Result)
 		}
@@ -28,7 +28,7 @@ func TestViewImageCall(t *testing.T) {
 	// Disabled: view_image is an unknown tool.
 	a.cfg.ViewImage = false
 	tc.Function.Arguments = `{"url":"https://cdn.example.com/a.png"}`
-	c = a.newCall(context.Background(), m, 0, tc)
+	c = a.newCall(context.Background(), m, 0, tc, nil)
 	if !strings.Contains(string(c.Result), "unknown tool") {
 		t.Fatalf("%s", c.Result)
 	}

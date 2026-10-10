@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -55,5 +56,75 @@ func TestLoadResources(t *testing.T) {
 	fsys["untitled.md"] = &fstest.MapFile{Data: []byte("# no frontmatter")}
 	if _, err := loadResources(Config{Docs: fsys}); err == nil || !strings.Contains(err.Error(), "untitled.md") {
 		t.Fatalf("want missing-title error, got %v", err)
+	}
+}
+
+// A document already returned in the context window, unchanged, is answered
+// with a short note; a changed one is sent again, marked as replacing the old
+// copy; after compaction (the result no longer in the window) it is sent in full.
+func TestReadDocSkipsWhatIsAlreadyLoaded(t *testing.T) {
+	fsys := fstest.MapFS{"a.md": {Data: []byte("---\ntitle: Alpha\n---\nAlpha body")}}
+	cfg := Config{Docs: fsys}
+	res, err := loadResources(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{log: newLogger(Config{}), cfg: cfg, res: res}
+	read := func(window []Message, args string) string {
+		m := &Message{ID: "m"}
+		tc := ToolCall{ID: "now"}
+		tc.Function.Name, tc.Function.Arguments = ReadDocTool, args
+		c := a.newCall(context.Background(), m, 0, tc, a.loadedDocsIn(window))
+		return toolContent(c.Result)
+	}
+	// window builds an assistant message calling read_doc and its tool answer.
+	window := func(args, content string) []Message {
+		tc := ToolCall{ID: "t1", Type: "function"}
+		tc.Function.Name, tc.Function.Arguments = ReadDocTool, args
+		asst, _ := marshalJSON(map[string]any{"role": "assistant", "content": "", "tool_calls": []ToolCall{tc}})
+		return []Message{{Raw: asst}, {Raw: toolMessageRaw("t1", content)}}
+	}
+
+	full := read(nil, `{"title":"Alpha"}`)
+	if !strings.Contains(full, "Alpha body") {
+		t.Fatalf("first read: %q", full)
+	}
+	if got := read(window(`{"title":"alpha"}`, full), `{"title":"Alpha"}`); !strings.Contains(got, docAlreadyLoaded) || strings.Contains(got, "Alpha body") {
+		t.Fatalf("unchanged document must not be sent again: %q", got)
+	}
+	// Compacted away (or never read): the window is empty, so it comes in full.
+	if got := read(nil, `{"title":"Alpha"}`); got != full {
+		t.Fatalf("not in the window: %q", got)
+	}
+	// Text that looks like a result but is not a read_doc answer does not count.
+	if got := read([]Message{{Raw: toolMessageRaw("x", full)}}, `{"title":"Alpha"}`); got != full {
+		t.Fatalf("an unmatched tool message must not count: %q", got)
+	}
+
+	// The document changes on disk: sent again, marked as the current version.
+	fsys["a.md"] = &fstest.MapFile{Data: []byte("---\ntitle: Alpha\n---\nAlpha body v2")}
+	changed := read(window(`{"title":"Alpha"}`, full), `{"title":"Alpha"}`)
+	if !strings.Contains(changed, docChanged) || !strings.Contains(changed, "Alpha body v2") {
+		t.Fatalf("changed document: %q", changed)
+	}
+	// That marked copy counts as loaded: reading again is a note, not a third copy.
+	if got := read(window(`{"title":"Alpha"}`, changed), `{"title":"Alpha"}`); !strings.Contains(got, docAlreadyLoaded) {
+		t.Fatalf("after the changed copy: %q", got)
+	}
+	// A note alone is not a copy: if only the note is left in the window, send it in full.
+	note := read(window(`{"title":"Alpha"}`, changed), `{"title":"Alpha"}`)
+	if got := read(window(`{"title":"Alpha"}`, note), `{"title":"Alpha"}`); !strings.Contains(got, "Alpha body v2") || strings.Contains(got, docChanged) {
+		t.Fatalf("only a note in the window: %q", got)
+	}
+
+	// Two reads of the same document in one turn: the second is a note.
+	loaded := a.loadedDocsIn(nil)
+	first := a.readDoc(`{"title":"Alpha"}`, loaded)
+	if second := a.readDoc(`{"title":"Alpha"}`, loaded); !strings.Contains(first, "Alpha body v2") || !strings.Contains(second, docAlreadyLoaded) {
+		t.Fatalf("same turn: %q / %q", first, second)
+	}
+	// nil turns it off (crash recovery).
+	if got := a.readDoc(`{"title":"Alpha"}`, nil); !strings.Contains(got, "Alpha body v2") {
+		t.Fatalf("nil loaded: %q", got)
 	}
 }

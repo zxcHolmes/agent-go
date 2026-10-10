@@ -174,8 +174,9 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 		"prompt_tokens", usage.PromptTokens, "cached_tokens", usage.CachedTokens, "completion_tokens", usage.CompletionTokens,
 		"latency_ms", latency)
 	calls := make([]RPCCall, 0, len(msg.ToolCalls))
+	loaded := a.loadedDocsIn(history) // exactly what this request sent
 	for i, tc := range msg.ToolCalls {
-		c := a.newCall(ctx, msg, i, tc)
+		c := a.newCall(ctx, msg, i, tc, loaded)
 		if err := a.createCall(ctx, st, &c); err != nil {
 			return false, err
 		}

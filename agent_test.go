@@ -181,7 +181,7 @@ func TestValidateMode(t *testing.T) {
 		tc := ToolCall{ID: "t1"}
 		tc.Function.Name = "json_rpc"
 		tc.Function.Arguments = `{"jsonrpc":"2.0","id":1,"method":"` + method + `","params":` + params + `}`
-		return a.newCall(context.Background(), m, 0, tc)
+		return a.newCall(context.Background(), m, 0, tc, nil)
 	}
 
 	// A valid call is held for confirmation as before.
