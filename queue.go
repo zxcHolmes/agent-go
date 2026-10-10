@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -41,11 +42,18 @@ type userContentPart struct {
 // must be absolute http(s) URLs; inline data (base64 "data:" URLs) is refused.
 func checkUserMessage(raw json.RawMessage) error {
 	var m struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role     string          `json:"role"`
+		Content  json.RawMessage `json:"content"`
+		Reminder json.RawMessage `json:"agent_reminder"`
 	}
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return fmt.Errorf("%w: not a JSON object", ErrInvalidUserMessage)
+	}
+	if len(m.Reminder) > 0 {
+		var r string
+		if json.Unmarshal(m.Reminder, &r) != nil {
+			return fmt.Errorf("%w: %s must be a string", ErrInvalidUserMessage, MessageReminderKey)
+		}
 	}
 	if m.Role != "user" {
 		return fmt.Errorf("%w: role must be \"user\"", ErrInvalidUserMessage)
@@ -172,21 +180,48 @@ func deleteQueued(ctx context.Context, store Store, sessionID, id string) error 
 	return err
 }
 
-// userMessage builds a user message from raw, appending Config.Reminder to
-// what the model sees while Content keeps the text as written.
+// MessageReminderKey is the optional field of a caller-built user message
+// that carries a reminder for that message only, e.g.
+// {"role":"user","content":"...","agent_reminder":"Make a slide video."}.
+// It is removed from what the model receives and joined after
+// Config.Reminder inside the <reminder> block; Message.Content keeps the
+// user's own text, so a UI never shows it.
+const MessageReminderKey = "agent_reminder"
+
+// userMessage builds a user message from raw, appending Config.Reminder and
+// the message's own reminder (MessageReminderKey) to what the model sees
+// while Content keeps the text as written.
 func (a *Agent) userMessage(raw json.RawMessage) (Message, error) {
 	m := newMessage(a.sessionID, raw, MessageDone)
-	if a.cfg.Reminder == "" {
-		return m, nil
-	}
-	reminder := "<reminder>\n" + a.cfg.Reminder + "\n</reminder>"
 	var msg struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role     string          `json:"role"`
+		Content  json.RawMessage `json:"content"`
+		Reminder *string         `json:"agent_reminder"`
 	}
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return m, err
 	}
+	var notes []string
+	for _, r := range []string{a.cfg.Reminder, deref(msg.Reminder)} {
+		if r = strings.TrimSpace(r); r != "" {
+			notes = append(notes, r)
+		}
+	}
+	if len(notes) == 0 && msg.Reminder == nil {
+		return m, nil // nothing to add: the raw is sent exactly as given
+	}
+	if len(notes) == 0 { // an empty agent_reminder: only drop the field
+		stripped, err := marshalJSON(struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		}{msg.Role, msg.Content})
+		if err != nil {
+			return m, err
+		}
+		m.Raw = stripped
+		return m, nil
+	}
+	reminder := "<reminder>\n" + strings.Join(notes, "\n\n") + "\n</reminder>"
 	var text string
 	if json.Unmarshal(msg.Content, &text) == nil {
 		b, err := marshalJSON(text + "\n\n" + reminder)
@@ -209,12 +244,22 @@ func (a *Agent) userMessage(raw json.RawMessage) (Message, error) {
 		}
 		msg.Content = b
 	}
-	withReminder, err := marshalJSON(msg)
+	withReminder, err := marshalJSON(struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}{msg.Role, msg.Content})
 	if err != nil {
 		return m, err
 	}
 	m.Raw = withReminder // Content stays the user's own text
 	return m, nil
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // drainQueue moves queued messages into the conversation. It first claims

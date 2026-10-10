@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -126,5 +127,52 @@ func TestReadDocSkipsWhatIsAlreadyLoaded(t *testing.T) {
 	// nil turns it off (crash recovery).
 	if got := a.readDoc(`{"title":"Alpha"}`, nil); !strings.Contains(got, "Alpha body v2") {
 		t.Fatalf("nil loaded: %q", got)
+	}
+}
+
+// A message's own reminder (agent_reminder) reaches the model after
+// Config.Reminder, is removed from the raw, and never enters Content.
+func TestUserMessagePerMessageReminder(t *testing.T) {
+	a := &Agent{log: newLogger(Config{}), sessionID: "s"}
+	sent := func(raw string) (Message, map[string]any) {
+		m, err := a.userMessage(json.RawMessage(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		_ = json.Unmarshal(m.Raw, &got)
+		return m, got
+	}
+
+	// Neither: the raw goes out byte for byte as given.
+	plain := `{"role":"user","content":"hi"}`
+	if m, _ := sent(plain); string(m.Raw) != plain {
+		t.Fatalf("untouched raw changed: %s", m.Raw)
+	}
+	// Only the message's reminder.
+	m, got := sent(`{"role":"user","content":"make it","agent_reminder":"Slide video."}`)
+	if m.Content != "make it" || got["agent_reminder"] != nil || !strings.Contains(got["content"].(string), "<reminder>\nSlide video.\n</reminder>") {
+		t.Fatalf("message reminder: content %q raw %s", m.Content, m.Raw)
+	}
+	// Both: the config's first, then the message's, in one block.
+	a.cfg.Reminder = "Full effort."
+	_, got = sent(`{"role":"user","content":"make it","agent_reminder":"Slide video."}`)
+	if c := got["content"].(string); !strings.Contains(c, "<reminder>\nFull effort.\n\nSlide video.\n</reminder>") {
+		t.Fatalf("both: %q", c)
+	}
+	// An empty agent_reminder is only dropped.
+	a.cfg.Reminder = ""
+	if m, got := sent(`{"role":"user","content":"hi","agent_reminder":"  "}`); got["agent_reminder"] != nil || got["content"] != "hi" || m.Content != "hi" {
+		t.Fatalf("empty reminder: %s", m.Raw)
+	}
+	// Multimodal: the reminder is one more text part; Content is the user's text.
+	m, got = sent(`{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"https://x/a.png"}}],"agent_reminder":"AI clip."}`)
+	parts := got["content"].([]any)
+	if len(parts) != 3 || !strings.Contains(parts[2].(map[string]any)["text"].(string), "AI clip.") || m.Content != "look" {
+		t.Fatalf("multimodal: content %q raw %s", m.Content, m.Raw)
+	}
+	// A non-string agent_reminder is refused when the message is queued.
+	if err := checkUserMessage(json.RawMessage(`{"role":"user","content":"x","agent_reminder":1}`)); err == nil {
+		t.Fatal("a non-string agent_reminder must be refused")
 	}
 }

@@ -738,7 +738,9 @@ client.EnqueueMessage(ctx, sid, rawJSON)                 // 多模态消息
 agent.Config{Reminder: "回答要简洁，金额一律用人民币。"}
 ```
 
-每条用户消息（`Chat`、`ChatMessage`、队列消息）发给模型时，末尾都会附加 `<reminder>…</reminder>`。多模态消息则追加一个文本片段。附加后的内容会写进 `raw`，以后重放时字节不变，不影响前缀缓存；`Message.Content` 里保存的仍是用户输入的原文，前端不会显示 reminder。
+每条用户消息（`Chat`、`ChatMessage`、队列消息）发给模型时，末尾都会附加 `<reminder>…</reminder>`。
+
+**按消息的 reminder**：宿主自己构造的用户消息里可以多带一个字段 `agent_reminder`（常量 `MessageReminderKey`），只对这一条消息生效，例如 `{"role":"user","content":"做个视频","agent_reminder":"用户选了幻灯片视频模式"}`。发给模型时这个字段会被删掉，内容接在 `Config.Reminder` 后面，放进同一个 `<reminder>` 块；`Message.Content` 和排队消息的 `Content` 仍然只有用户原文，前端不会显示。字段不是字符串时入队会被拒绝；空字符串只会被删掉。多模态消息则追加一个文本片段。附加后的内容会写进 `raw`，以后重放时字节不变，不影响前缀缓存；`Message.Content` 里保存的仍是用户输入的原文，前端不会显示 reminder。
 
 ### 前缀缓存
 
