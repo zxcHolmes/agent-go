@@ -190,7 +190,7 @@ func (a *Agent) execute(ctx context.Context, st *runState, c *RPCCall) error {
 
 // loaded is what the model already has of the mounted documents (see
 // loadedDocs); nil sends every read_doc result in full.
-func (a *Agent) newCall(ctx context.Context, m *Message, i int, tc ToolCall, loaded loadedDocs) RPCCall {
+func (a *Agent) newCall(ctx context.Context, m *Message, i int, tc ToolCall, loaded *loadedDocs) RPCCall {
 	now := time.Now()
 	c := RPCCall{
 		ID: newID("call"), SessionID: a.sessionID, MessageID: m.ID, ToolCallID: tc.ID, Index: i,

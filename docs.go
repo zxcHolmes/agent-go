@@ -191,7 +191,15 @@ func (a *Agent) docsPromptSection() string {
 // window this step sends, plus the results answered earlier in the same turn.
 // Compaction drops old results from the window, so a document read before a
 // compaction is sent again in full.
-type loadedDocs map[docPage]string
+//
+// repeats counts the read_doc answers in the current turn (since the latest
+// user message in the window) that pointed at a copy already there, so a
+// model that keeps re-reading what it has is told to stop: it is derived
+// from the window, like the copies, and survives a restart.
+type loadedDocs struct {
+	pages   map[docPage]string
+	repeats int
+}
 
 type docPage struct {
 	title string // lower-cased
@@ -202,13 +210,15 @@ type docPage struct {
 const (
 	docAlreadyLoaded = "(Already loaded: this document is unchanged since your earlier read_doc call, whose result is still in this conversation. Use that copy; it is not sent again.)"
 	docChanged       = "(This document changed since you last read it. This is the current version; it replaces the earlier copy.)"
+	// Added to the note from the second repeat of a turn on.
+	docStopRereading = " You have now asked %d times in this turn for documents that are already in your context, and reading them again adds nothing. Stop calling read_doc for them: use the copies you have and take the next step of the task now."
 )
 
 // loadedDocsIn collects the read_doc results in a context window. A result is
 // matched to its call through the assistant message's tool calls, so only
 // real read_doc answers count, never text that merely looks like one.
-func (a *Agent) loadedDocsIn(window []Message) loadedDocs {
-	l := loadedDocs{}
+func (a *Agent) loadedDocsIn(window []Message) *loadedDocs {
+	l := &loadedDocs{pages: map[docPage]string{}}
 	if !a.hasDocs() {
 		return l
 	}
@@ -216,6 +226,10 @@ func (a *Agent) loadedDocsIn(window []Message) loadedDocs {
 	for _, m := range window {
 		d := decodeMessage(m.Raw)
 		switch d.Role {
+		case "user":
+			if m.Kind == "" {
+				l.repeats = 0 // a new turn
+			}
 		case "assistant":
 			for _, tc := range d.ToolCalls {
 				if tc.Function.Name != ReadDocTool {
@@ -231,9 +245,10 @@ func (a *Agent) loadedDocsIn(window []Message) loadedDocs {
 				continue // not a read_doc call, or an error answer
 			}
 			if _, rest, _ := strings.Cut(d.Content, "\n"); strings.HasPrefix(rest, docAlreadyLoaded) {
+				l.repeats++
 				continue // a pointer to an earlier copy, not a copy
 			}
-			l[key] = strings.Replace(d.Content, "\n"+docChanged, "", 1)
+			l.pages[key] = strings.Replace(d.Content, "\n"+docChanged, "", 1)
 		}
 	}
 	return l
@@ -243,7 +258,7 @@ func (a *Agent) loadedDocsIn(window []Message) loadedDocs {
 // confirmation). The result is plain text, stored as a JSON string. With
 // loaded (nil disables it), a document the model already has, unchanged, is
 // answered with a short note instead of its text.
-func (a *Agent) newReadDocCall(c *RPCCall, arguments string, loaded loadedDocs) {
+func (a *Agent) newReadDocCall(c *RPCCall, arguments string, loaded *loadedDocs) {
 	c.Method, c.Status = ReadDocTool, CallDone
 	text := a.readDoc(arguments, loaded)
 	c.Params = json.RawMessage(arguments)
@@ -269,7 +284,7 @@ func (a *Agent) docArgs(arguments string) (*Doc, int, bool) {
 	return doc, args.Page, doc != nil
 }
 
-func (a *Agent) readDoc(arguments string, loaded loadedDocs) string {
+func (a *Agent) readDoc(arguments string, loaded *loadedDocs) string {
 	var args struct {
 		Title string `json:"title"`
 		Page  int    `json:"page"`
@@ -307,13 +322,18 @@ func (a *Agent) readDoc(arguments string, loaded loadedDocs) string {
 		return text
 	}
 	key := docPage{strings.ToLower(doc.Title), page}
-	prev, seen := loaded[key]
-	loaded[key] = text
+	prev, seen := loaded.pages[key]
+	loaded.pages[key] = text
 	switch {
 	case !seen:
 		return text
 	case prev == text:
-		return "# " + doc.Title + "\n" + docAlreadyLoaded
+		loaded.repeats++
+		note := "# " + doc.Title + "\n" + docAlreadyLoaded
+		if loaded.repeats >= 2 {
+			note += fmt.Sprintf(docStopRereading, loaded.repeats)
+		}
+		return note
 	default:
 		return "# " + doc.Title + "\n" + docChanged + strings.TrimPrefix(text, "# "+doc.Title)
 	}

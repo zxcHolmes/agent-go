@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -127,6 +128,62 @@ func TestReadDocSkipsWhatIsAlreadyLoaded(t *testing.T) {
 	// nil turns it off (crash recovery).
 	if got := a.readDoc(`{"title":"Alpha"}`, nil); !strings.Contains(got, "Alpha body v2") {
 		t.Fatalf("nil loaded: %q", got)
+	}
+}
+
+// Re-reading documents already in the context is answered with a note; from
+// the second such note in a turn the note tells the model to stop and act.
+// The count is read from the window and starts again with each user message.
+func TestReadDocTellsToStopRereading(t *testing.T) {
+	fsys := fstest.MapFS{
+		"a.md": {Data: []byte("---\ntitle: Alpha\n---\nAlpha body")},
+		"b.md": {Data: []byte("---\ntitle: Beta\n---\nBeta body")},
+	}
+	cfg := Config{Docs: fsys}
+	res, err := loadResources(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{log: newLogger(Config{}), cfg: cfg, res: res}
+	n := 0
+	call := func(title, content string) []Message {
+		n++
+		id := fmt.Sprintf("t%d", n)
+		tc := ToolCall{ID: id, Type: "function"}
+		tc.Function.Name, tc.Function.Arguments = ReadDocTool, `{"title":"`+title+`"}`
+		asst, _ := marshalJSON(map[string]any{"role": "assistant", "content": "", "tool_calls": []ToolCall{tc}})
+		return []Message{{Raw: asst}, {Raw: toolMessageRaw(id, content)}}
+	}
+	user := func() Message {
+		raw, _ := userRaw("go on")
+		return Message{Role: "user", Raw: raw}
+	}
+	alpha := a.readDoc(`{"title":"Alpha"}`, nil)
+	beta := a.readDoc(`{"title":"Beta"}`, nil)
+	note := func(title string) string { return "# " + title + "\n" + docAlreadyLoaded }
+
+	window := append([]Message{user()}, call("Alpha", alpha)...)
+	window = append(window, call("Beta", beta)...)
+	if got := a.readDoc(`{"title":"Alpha"}`, a.loadedDocsIn(window)); got != note("Alpha") {
+		t.Fatalf("first repeat is the plain note: %q", got)
+	}
+	window = append(window, call("Alpha", note("Alpha"))...)
+	got := a.readDoc(`{"title":"Beta"}`, a.loadedDocsIn(window))
+	if !strings.HasPrefix(got, note("Beta")) || !strings.Contains(got, "asked 2 times") || !strings.Contains(got, "Stop calling read_doc") {
+		t.Fatalf("second repeat must tell the model to stop: %q", got)
+	}
+	window = append(window, call("Beta", got)...)
+	if got := a.readDoc(`{"title":"Alpha"}`, a.loadedDocsIn(window)); !strings.Contains(got, "asked 3 times") {
+		t.Fatalf("third repeat: %q", got)
+	}
+	// The stronger note is still only a pointer: the copies stay loaded.
+	if l := a.loadedDocsIn(window); l.pages[docPage{"beta", 1}] != beta {
+		t.Fatal("a note must not replace the copy")
+	}
+	// A new user message starts a new turn: the count starts again.
+	window = append(window, user())
+	if got := a.readDoc(`{"title":"Alpha"}`, a.loadedDocsIn(window)); got != note("Alpha") {
+		t.Fatalf("after a user message: %q", got)
 	}
 }
 
