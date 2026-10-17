@@ -160,6 +160,20 @@ func latestCompaction(ctx context.Context, store Store, sessionID string) (*Mess
 	return &ms[0], nil
 }
 
+// latestUserBefore returns the newest message the user wrote before seq (not
+// an injected image or a compaction summary), or nil.
+func latestUserBefore(ctx context.Context, store Store, sessionID string, seq int64) (*Message, error) {
+	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND role = 'user' AND kind = '' AND seq < ? ORDER BY seq DESC LIMIT 1", sessionID, seq)
+	if err != nil {
+		return nil, err
+	}
+	ms, err := scanMessages(rows)
+	if err != nil || len(ms) == 0 {
+		return nil, err
+	}
+	return &ms[0], nil
+}
+
 // lastAssistant returns the newest assistant message, if any.
 func lastAssistant(ctx context.Context, store Store, sessionID string) (*Message, error) {
 	rows, err := store.Query(ctx, "SELECT "+messageCols+" FROM agent_messages WHERE session_id = ? AND role = 'assistant' ORDER BY seq DESC LIMIT 1", sessionID)

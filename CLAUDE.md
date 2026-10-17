@@ -90,6 +90,13 @@ settlement. User-facing docs are in `README.md` (Chinese).
   templates). It is not checked against ContextLength (a host budget, not
   the model's limit). Failed / no text → compact without notes; there is no
   transcript fallback.
+- Compaction cuts at the latest real user message; when the current turn
+  already starts the window (one long turn of tool calls) it cuts INSIDE the
+  turn, at an assistant message (never a tool message — `stepAnchor`), and the
+  marker is a SENT user message repeating the turn's request
+  (`latestUserBefore`, `inTurnRaw`) after the notes, so the window still opens
+  with a user message. Only a first message too big on its own still ends in
+  `ErrContextLengthExceeded`.
 - After a compaction, the last LLM call's token count no longer describes the
   window (`estimateTokens` checks this); usage rows of summary calls point at the
   compaction message, not an assistant message.

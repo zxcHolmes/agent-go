@@ -12,7 +12,7 @@ import (
 // defaultCompactionRequest is the user message appended to the context when
 // the model writes its own notes (see summarize).
 const defaultCompactionRequest = "Context checkpoint: everything above is about to be removed from your context. " +
-	"Only your notes and the latest user request, with what follows it, will remain. " +
+	"Only your notes, the latest user request and your most recent steps after it will remain. " +
 	"Write the notes you need to continue: the user's goals and preferences, key facts, names, and every id, URL and number still needed, copied exactly; " +
 	"decisions taken, results of tool calls, and any unfinished tasks. " +
 	"Do not call any tool and do not address the user. Write only the notes."
@@ -160,8 +160,11 @@ func (a *Agent) outputBudget(est int) (int, error) {
 
 // compact moves the start of the context to the most recent user message
 // and records a compaction message; in summary mode the dropped messages are
-// summarized first. It reports false when there is nothing to drop (the
-// current turn already starts the window).
+// summarized first. When the current turn already starts the window — one
+// long turn of tool calls since the user last spoke — it cuts inside the turn
+// instead, at the start of a step (see stepAnchor), and the compaction
+// message repeats the turn's user request so the model can carry on. It
+// reports false when there is nothing to drop.
 func (a *Agent) compact(ctx context.Context, st *runState, window []Message, marker *Message, est int) (bool, error) {
 	var anchor *Message
 	for i := len(window) - 1; i >= 0; i-- {
@@ -177,8 +180,15 @@ func (a *Agent) compact(ctx context.Context, st *runState, window []Message, mar
 			break
 		}
 	}
+	var request *Message // set when cutting inside the turn
 	if anchor == nil || anchor.Seq <= firstSeq {
-		return false, nil
+		if anchor = a.stepAnchor(window, firstSeq); anchor == nil {
+			return false, nil
+		}
+		var err error
+		if request, err = latestUserBefore(st.db, a.store, a.sessionID, anchor.Seq); err != nil || request == nil {
+			return false, err // no request to repeat: the window could not open with a user message
+		}
 	}
 	m := Message{
 		ID: newID("msg"), SessionID: a.sessionID, Kind: MessageKindCompaction, RefSeq: anchor.Seq,
@@ -186,8 +196,9 @@ func (a *Agent) compact(ctx context.Context, st *runState, window []Message, mar
 	}
 	note := fmt.Sprintf("Context compacted: messages before #%d are no longer sent to the model.", anchor.Seq)
 	var rec *UsageRecord
+	summary := ""
 	if a.cfg.Compaction == CompactionSummary {
-		summary, r, err := a.summarize(ctx, st, window, est, m.ID)
+		s, r, err := a.summarize(ctx, st, window, est, m.ID)
 		if err != nil {
 			var rej *rejectedError
 			if errors.As(err, &rej) {
@@ -200,12 +211,30 @@ func (a *Agent) compact(ctx context.Context, st *runState, window []Message, mar
 			// Keep the conversation going without a summary rather than failing it.
 			note += " (summary failed: " + truncate(err.Error(), 200) + ")"
 		} else {
-			rec = r
-			raw, _ := userRaw("<conversation_summary>\nThe earlier part of this conversation was compacted. Notes:\n" + summary + "\n</conversation_summary>")
-			m.Role, m.Raw, m.Content, m.Status = "user", raw, summary, MessageDone
+			summary, rec = s, r
 		}
 	}
-	if m.Raw == nil {
+	notes := ""
+	if summary != "" {
+		notes = "<conversation_summary>\nThe earlier part of this conversation was compacted. Notes:\n" + summary + "\n</conversation_summary>"
+	}
+	switch {
+	case request != nil:
+		// The window now starts inside the turn, so it must open with a user
+		// message: the notes (if any) and the request the turn is working on.
+		raw, err := inTurnRaw(notes, request.Raw)
+		if err != nil {
+			return false, err
+		}
+		m.Role, m.Raw, m.Status = "user", raw, MessageDone
+		m.Content = summary
+		if m.Content == "" {
+			m.Content = note
+		}
+	case notes != "":
+		raw, _ := userRaw(notes)
+		m.Role, m.Raw, m.Content, m.Status = "user", raw, summary, MessageDone
+	default:
 		m.Raw, _ = marshalJSON(struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
@@ -220,7 +249,80 @@ func (a *Agent) compact(ctx context.Context, st *runState, window []Message, mar
 			return false, err
 		}
 	}
+	if request != nil {
+		a.log.Info("context compacted inside a turn", "session", a.sessionID, "restart_at_seq", anchor.Seq, "request_seq", request.Seq)
+	}
 	return true, nil
+}
+
+// stepKeepShare is the share of the compaction threshold that the steps kept
+// after an in-turn compaction may take, so the next compaction is several
+// steps away rather than one.
+const stepKeepShare = 0.25
+
+// stepAnchor picks where to cut inside the current turn: the start of a step
+// (an assistant message, so no tool message is cut off from its call), the
+// earliest one whose steps from there on fit in stepKeepShare of the
+// threshold, and always at least the latest step. nil when the only step
+// already starts the window.
+func (a *Agent) stepAnchor(window []Message, firstSeq int64) *Message {
+	keep := int(stepKeepShare * a.cfg.CompactionThreshold * float64(a.cfg.ContextLength))
+	var anchor *Message
+	tail := 0
+	for i := len(window) - 1; i >= 0; i-- {
+		m := &window[i]
+		if m.Kind == MessageKindCompaction || m.Seq <= firstSeq {
+			break
+		}
+		tail += messageTokens(m.Raw)
+		if m.Role != "assistant" || m.Kind != "" {
+			continue
+		}
+		if anchor != nil && tail > keep {
+			break
+		}
+		anchor = m
+	}
+	return anchor
+}
+
+// inTurnRaw builds the user message that opens the window after an in-turn
+// compaction: the notes, then the request the turn is working on, repeated
+// with its images (and the reminder it was sent with).
+func inTurnRaw(notes string, request json.RawMessage) (json.RawMessage, error) {
+	head := "Context compacted in the middle of your work on the user's latest request, repeated below. "
+	if notes != "" {
+		head = notes + "\n\nThe compaction happened in the middle of your work on the user's latest request, repeated below. "
+	}
+	head += "Only your most recent steps follow; earlier ones are no longer in your context, so check what already exists before redoing anything. Continue the work.\n\n<user_request>\n"
+	tail := "\n</user_request>"
+	var msg struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(request, &msg); err != nil {
+		return nil, fmt.Errorf("agent: read the request to repeat: %w", err)
+	}
+	var text string
+	if json.Unmarshal(msg.Content, &text) == nil {
+		return userRaw(head + text + tail)
+	}
+	var parts []json.RawMessage
+	if err := json.Unmarshal(msg.Content, &parts); err != nil {
+		return nil, fmt.Errorf("agent: read the request to repeat: %w", err)
+	}
+	textPart := func(s string) json.RawMessage {
+		b, _ := marshalJSON(struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{"text", s})
+		return b
+	}
+	all := append([]json.RawMessage{textPart(head)}, parts...)
+	all = append(all, textPart(tail))
+	return marshalJSON(struct {
+		Role    string            `json:"role"`
+		Content []json.RawMessage `json:"content"`
+	}{"user", all})
 }
 
 // summaryMaxTokens caps the notes a summary call may write.

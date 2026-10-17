@@ -137,12 +137,11 @@ func TestCompactionSummary(t *testing.T) {
 }
 
 func TestCompactionNoProgressAndOff(t *testing.T) {
-	// A single huge turn cannot be compacted (the window already starts at
-	// its user message); the run continues until the budget runs out.
+	// A first message too big on its own cannot be compacted: there is no
+	// step yet to cut at, so the run fails before calling the model.
 	e, a := compactionEnv(t, "")
 	ctx := context.Background()
-	e.llm.pushReply(reply{msg: toolCall("t1", "get_order", `{"order_id":"O"}`), hangAfter: -1, prompt: 9990})
-	_, err := a.Chat(ctx, "big")
+	_, err := a.Chat(ctx, strings.Repeat("big ", 9000))
 	if err == nil || !strings.Contains(err.Error(), "context length") {
 		t.Fatalf("want ErrContextLengthExceeded, got %v", err)
 	}
@@ -162,6 +161,84 @@ func TestCompactionNoProgressAndOff(t *testing.T) {
 	}
 	if n := len(e2.llm.request(1)); n != 4 { // system, a, A, b: nothing dropped
 		t.Fatalf("off mode dropped messages: %d", n)
+	}
+}
+
+// requestRoles lists the roles of a request's messages.
+func requestRoles(msgs []json.RawMessage) string {
+	var out []string
+	for _, s := range requestShape(msgs) {
+		out = append(out, s[:strings.Index(s, ":")])
+	}
+	return strings.Join(out, " ")
+}
+
+// One long turn of tool calls — the user spoke once — is compacted inside the
+// turn, at the start of a step: the window opens with a user message repeating
+// the request, followed by the latest steps, and the run carries on.
+func TestCompactionInsideTurn(t *testing.T) {
+	e, a := compactionEnv(t, "") // anchor mode
+	ctx := context.Background()
+	e.llm.pushReply(reply{msg: toolCall("t1", "get_order", `{"order_id":"O1"}`), hangAfter: -1, prompt: 500})
+	e.llm.pushReply(reply{msg: toolCall("t2", "get_order", `{"order_id":"O2"}`), hangAfter: -1, prompt: 8500})
+	e.llm.pushReply(reply{msg: toolCall("t3", "get_order", `{"order_id":"O3"}`), hangAfter: -1, prompt: 8600})
+	e.llm.pushReply(reply{msg: text("done"), hangAfter: -1, prompt: 700})
+	if _, err := a.Chat(ctx, "make the video"); err != nil {
+		t.Fatal(err)
+	}
+	// First compaction (before the third call): the user message is dropped
+	// and repeated in the one that opens the window; both steps fit and stay.
+	r := e.llm.request(2)
+	if got := requestRoles(r); got != "system user assistant tool assistant tool" {
+		t.Fatalf("after the first in-turn compaction: %s", got)
+	}
+	if !strings.Contains(string(r[1]), "make the video") || !strings.Contains(string(r[1]), "Context compacted in the middle") {
+		t.Fatalf("the window must open with the request: %s", r[1])
+	}
+	// Second compaction in the same turn: the request is found again before
+	// the previous compaction, and the cut moves to the next step.
+	r = e.llm.request(3)
+	if got := requestRoles(r); got != "system user assistant tool assistant tool" {
+		t.Fatalf("after the second in-turn compaction: %s", got)
+	}
+	if !strings.Contains(string(r[1]), "make the video") || !strings.Contains(string(r[2]), "t2") {
+		t.Fatalf("second compaction: %s / %s", r[1], r[2])
+	}
+	all, _ := e.client.LatestMessages(ctx, a.SessionID(), 100)
+	markers := 0
+	for _, m := range all {
+		if m.Kind == agent.MessageKindCompaction {
+			markers++
+			if m.Status != agent.MessageDone || m.Role != "user" {
+				t.Fatalf("in-turn marker must be sent: %+v", m)
+			}
+		}
+	}
+	if markers != 2 {
+		t.Fatalf("want 2 compactions, got %d", markers)
+	}
+}
+
+func TestCompactionInsideTurnSummary(t *testing.T) {
+	e, a := compactionEnv(t, agent.CompactionSummary)
+	ctx := context.Background()
+	e.llm.pushReply(reply{msg: toolCall("t1", "get_order", `{"order_id":"O1"}`), hangAfter: -1, prompt: 500})
+	e.llm.pushReply(reply{msg: toolCall("t2", "get_order", `{"order_id":"O2"}`), hangAfter: -1, prompt: 8500})
+	e.llm.pushReply(reply{msg: text("notes: orders O1 and O2 looked up"), hangAfter: -1, prompt: 300}) // the summary
+	e.llm.pushReply(reply{msg: text("done"), hangAfter: -1, prompt: 700})
+	if _, err := a.Chat(ctx, "check my orders"); err != nil {
+		t.Fatal(err)
+	}
+	if got := requestShape(e.llm.request(2)); !strings.HasPrefix(got[len(got)-1], "user:Context checkpoint") {
+		t.Fatalf("summary request: %v", got)
+	}
+	r := e.llm.request(3)
+	if got := requestRoles(r); got != "system user assistant tool assistant tool" {
+		t.Fatalf("after compaction: %s", got)
+	}
+	first := string(r[1])
+	if !strings.Contains(first, "<conversation_summary>") || !strings.Contains(first, "orders O1 and O2") || !strings.Contains(first, "check my orders") {
+		t.Fatalf("the window must open with the notes and the request: %s", first)
 	}
 }
 
