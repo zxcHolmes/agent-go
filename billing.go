@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -35,7 +36,14 @@ func (u *Usage) add(o Usage) {
 
 // parseUsage understands the OpenAI shape plus common vendor variants
 // (DeepSeek prompt_cache_hit_tokens, Anthropic-style cache_*_input_tokens).
-func parseUsage(raw json.RawMessage) Usage {
+func parseUsage(raw json.RawMessage) Usage { return parseUsageFrom("", raw) }
+
+// parseUsageFrom parses the usage of the response with this id. A relay
+// that passes Claude through keeps Anthropic's id ("msg_…") and Anthropic's
+// meaning of prompt_tokens (without the cache); that is how the two are told
+// apart, since such relays (new-api) add the same extra fields to every
+// provider's usage.
+func parseUsageFrom(responseID string, raw json.RawMessage) Usage {
 	var u struct {
 		PromptTokens        int64 `json:"prompt_tokens"`
 		CompletionTokens    int64 `json:"completion_tokens"`
@@ -55,9 +63,6 @@ func parseUsage(raw json.RawMessage) Usage {
 		PromptCacheHitTokens     int64 `json:"prompt_cache_hit_tokens"`
 		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-		// Set by gateways (new-api / one-api) relaying Claude in the OpenAI
-		// format, which keep Anthropic's meaning of prompt_tokens.
-		ClaudeCacheCreation5m *int64 `json:"claude_cache_creation_5_m_tokens"`
 	}
 	if len(raw) == 0 || json.Unmarshal(raw, &u) != nil {
 		return Usage{}
@@ -82,8 +87,10 @@ func parseUsage(raw json.RawMessage) Usage {
 	// not. A Claude relay reports only the uncached ones there (cache reads and
 	// writes beside them), which priced reads and writes as free and made the
 	// context estimate a fraction of the real prompt: add them back. Its marks
-	// are its own fields, or more tokens read from cache than prompt_tokens.
-	if u.ClaudeCacheCreation5m != nil || u.PromptTokensDetails.CacheCreationInputTokens != nil || out.CachedTokens > out.PromptTokens {
+	// are an Anthropic response id, the cache writes in prompt_tokens_details,
+	// or more tokens read from cache than prompt_tokens. (Not new-api's
+	// claude_cache_creation_* fields: it adds them to GPT's usage too.)
+	if strings.HasPrefix(responseID, "msg_") || u.PromptTokensDetails.CacheCreationInputTokens != nil || out.CachedTokens > out.PromptTokens {
 		out.PromptTokens += out.CachedTokens + out.CacheWriteTokens
 		out.TotalTokens = out.PromptTokens + out.CompletionTokens
 	}

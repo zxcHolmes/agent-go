@@ -599,7 +599,7 @@ act.Sessions            // 一页会话：非 idle 的排前面，其余按 upda
 
 ### Token 记录与计费
 
-每次 LLM 调用都会写一条 `agent_llm_calls` 记录，包括：`prompt_tokens`、`completion_tokens`、`total_tokens`、`cached_tokens`（缓存读）、`cache_write_tokens`、`reasoning_tokens`、音频输入/输出、预测 accepted/rejected，以及接口返回的**原始 usage JSON**、finish_reason、延迟、各项积分。兼容 OpenAI、DeepSeek（`prompt_cache_hit_tokens`）、Anthropic 风格（`cache_read_input_tokens` / `cache_creation_input_tokens`）字段。`prompt_tokens` 一律按 OpenAI 的含义记录（包含缓存读写）：new-api 一类网关转发 Claude 时 `prompt_tokens` 只含未缓存部分（带 `claude_cache_creation_5_m_tokens` 或 `prompt_tokens_details.cache_creation_input_tokens` 字段，或缓存读多于 `prompt_tokens`），解析时把缓存读写加回去，否则缓存读写不计费、上下文估算也会严重偏小。
+每次 LLM 调用都会写一条 `agent_llm_calls` 记录，包括：`prompt_tokens`、`completion_tokens`、`total_tokens`、`cached_tokens`（缓存读）、`cache_write_tokens`、`reasoning_tokens`、音频输入/输出、预测 accepted/rejected，以及接口返回的**原始 usage JSON**、finish_reason、延迟、各项积分。兼容 OpenAI、DeepSeek（`prompt_cache_hit_tokens`）、Anthropic 风格（`cache_read_input_tokens` / `cache_creation_input_tokens`）字段。`prompt_tokens` 一律按 OpenAI 的含义记录（包含缓存读写）：new-api 一类网关转发 Claude 时 `prompt_tokens` 只含未缓存部分（识别依据：响应 id 是 Anthropic 的 `msg_…`，或 `prompt_tokens_details` 里有 `cache_creation_input_tokens`，或缓存读多于 `prompt_tokens`；new-api 给 GPT 的用量也加 `claude_cache_creation_*` 字段，所以这些字段不能作为依据），解析时把缓存读写加回去，否则缓存读写不计费、上下文估算也会严重偏小。
 
 **中断的请求按估算计费**：用量只在流的最后一个分片里返回，请求中途断开（Stop、超时、网络断开）时上游照样收了钱，却拿不到用量。只要请求已被 provider 接受（收到 2xx）且不是 provider 自己在流里报错，就记一条估算记录：`finish_reason = "interrupted"`（`agent.FinishInterrupted`），`raw_usage` 里有 `"estimated": true`。输入按这次请求的估算值计，其中上一次调用已经发过的前缀算缓存读取，其余算输入；输出按已生成的文字、思考和工具参数字节数 ÷ 3 估算。每个断开的尝试一条记录，只有最后一条挂在被中断的消息上。写摘要的请求断开也一样。否则用户在每次回答快结束时点 Stop，整段对话就是免费的。
 

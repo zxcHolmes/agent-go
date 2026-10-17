@@ -45,6 +45,22 @@ func TestParseUsageClaudeRelay(t *testing.T) {
 	if math.Abs(c.Input-5154*800/1e6) > 1e-9 || math.Abs(c.CacheWrite-29206*1600/1e6) > 1e-9 {
 		t.Fatalf("cost %+v", c)
 	}
+	// A Claude reply that only read the cache, told apart by its id: the relay
+	// adds the same claude_* fields to GPT's usage, so they prove nothing.
+	claudeRead := parseUsageFrom("msg_011CfW", json.RawMessage(`{"prompt_tokens":4931,"completion_tokens":1488,"total_tokens":6419,
+		"prompt_tokens_details":{"cached_tokens":2794},"claude_cache_creation_5_m_tokens":0}`))
+	if claudeRead.PromptTokens != 4931+2794 {
+		t.Fatalf("claude cache read: %+v", claudeRead)
+	}
+	// GPT through the same relay (a real row): prompt_tokens already counts
+	// the cache, despite the claude_* fields.
+	gpt := parseUsageFrom("resp_0", json.RawMessage(`{"prompt_tokens":19457,"completion_tokens":1557,"total_tokens":21014,
+		"prompt_tokens_details":{"cached_tokens":5376,"text_tokens":0,"audio_tokens":0,"image_tokens":0},
+		"completion_tokens_details":{"text_tokens":0,"audio_tokens":0,"image_tokens":0,"reasoning_tokens":131},
+		"input_tokens":0,"output_tokens":0,"input_tokens_details":null,"claude_cache_creation_5_m_tokens":0,"claude_cache_creation_1_h_tokens":0}`))
+	if gpt.PromptTokens != 19457 || gpt.CachedTokens != 5376 || gpt.ReasoningTokens != 131 {
+		t.Fatalf("gpt through the relay: %+v", gpt)
+	}
 	// The OpenAI meaning is left alone: prompt_tokens already counts the cache.
 	std := parseUsage(json.RawMessage(`{"prompt_tokens":29452,"completion_tokens":2845,"total_tokens":32297,"prompt_tokens_details":{"cached_tokens":29056}}`))
 	if std.PromptTokens != 29452 || std.TotalTokens != 32297 {
