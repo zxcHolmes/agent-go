@@ -52,6 +52,9 @@ func (a *Agent) loop(ctx context.Context, st *runState) (StopReason, error) {
 		}
 		llmCalls++
 		hasCalls, err := a.step(ctx, st)
+		if errors.Is(err, errNoProgress) {
+			return StopNoProgress, nil
+		}
 		if err != nil {
 			if healed, herr := a.dropUnloadableImages(ctx, st, err); herr != nil {
 				return "", errors.Join(err, herr)

@@ -103,6 +103,11 @@ settlement. User-facing docs are in `README.md` (Chinese).
   `"estimated": true`): the estimated prompt, the previous call's part as
   cache reads (`runState.prefix`), output at 3 bytes a token. Upstream bills
   such requests and never reports their usage.
+- A model that repeats itself ends the run with `StopNoProgress`
+  (`progress.go`): the 4th identical step in a row (same calls, earlier ones
+  with the same results) is answered "not run" for every call and the run
+  stops; so does a read_doc-only step once 6 answers in the turn pointed at
+  copies already in the context. Notes alone did not stop a looping model.
 - After a compaction, the last LLM call's token count no longer describes the
   window (`estimateTokens` checks this); usage rows of summary calls point at the
   compaction message, not an assistant message.

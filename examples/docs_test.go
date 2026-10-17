@@ -110,3 +110,36 @@ func TestDocsLoadErrorsFailFast(t *testing.T) {
 		t.Fatal("missing SystemPromptFile must fail")
 	}
 }
+
+// Seen live: after a compaction a model read the same few documents in turn,
+// over and over, one read_doc per step. From the second repeat the note tells
+// it to stop; on the sixth the run ends with StopNoProgress.
+func TestRereadingDocsEndsTheRun(t *testing.T) {
+	e := setup(t)
+	e.cfg.Docs = fstest.MapFS{
+		"a.md": {Data: []byte("---\ntitle: Alpha\n---\nAlpha body")},
+		"b.md": {Data: []byte("---\ntitle: Beta\n---\nBeta body")},
+	}
+	ctx := context.Background()
+	client, err := agent.NewClient(ctx, e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := client.Agent(ctx, "", agent.AgentOptions{})
+	for i := 0; i < 12; i++ {
+		title := []string{"Alpha", "Beta"}[i%2]
+		e.llm.push(readDocCall(fmt.Sprintf("r%d", i), `{"title":"`+title+`"}`))
+	}
+	res, err := a.Chat(ctx, "read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two full reads, then six notes pointing at them.
+	if res.StopReason != agent.StopNoProgress || len(e.llm.requests) != 8 {
+		t.Fatalf("stop %s after %d requests", res.StopReason, len(e.llm.requests))
+	}
+	all, _ := client.LatestMessages(ctx, a.SessionID(), 100)
+	if last := all[len(all)-1]; !strings.Contains(last.Content, "asked 6 times") {
+		t.Fatalf("last note: %s", last.Content)
+	}
+}

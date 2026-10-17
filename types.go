@@ -92,6 +92,9 @@ const (
 	StopWaitingConfirmation StopReason = "waiting_confirmation"
 	StopStopped             StopReason = "stopped"
 	StopMaxSteps            StopReason = "max_steps"
+	// StopNoProgress: the model kept repeating itself (the same calls with
+	// the same results, or documents it already had); see progress.go.
+	StopNoProgress StopReason = "no_progress"
 )
 
 var (

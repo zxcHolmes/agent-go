@@ -182,8 +182,13 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 		"latency_ms", latency)
 	calls := make([]RPCCall, 0, len(msg.ToolCalls))
 	loaded := a.loadedDocsIn(history) // exactly what this request sent
+	same := sameStepsBefore(history, msg.ToolCalls) + 1
 	for i, tc := range msg.ToolCalls {
 		c := a.newCall(ctx, msg, i, tc, loaded)
+		if same >= sameStepsLimit {
+			// Every call still gets its tool message, so the history stays valid.
+			c.Status, c.Result = CallDone, rpcErrorResponse(c.RPCID, noProgressResult(same))
+		}
 		if cutOff(res.FinishReason) && !json.Valid([]byte(tc.Function.Arguments)) {
 			// The reply hit max_tokens while writing this call. A parse error
 			// would only make the model resend the same call and be cut off
@@ -198,6 +203,11 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	// Images go after every tool message of the turn to keep call/result pairing valid.
 	if err := a.attachImages(ctx, st, calls); err != nil {
 		return false, err
+	}
+	if same >= sameStepsLimit || (loaded.repeats >= rereadLimit && onlyReadDoc(calls)) {
+		a.log.Warn("run stopped: the model is repeating itself", "session", a.sessionID,
+			"same_steps", same, "rereads", loaded.repeats)
+		return false, errNoProgress
 	}
 	return len(msg.ToolCalls) > 0, nil
 }

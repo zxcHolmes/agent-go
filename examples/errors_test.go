@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -132,5 +133,35 @@ func TestToolCallCutOffAtOutputLimit(t *testing.T) {
 	}
 	if !strings.Contains(result, "output limit") || !strings.Contains(result, "Split the work") {
 		t.Fatalf("tool result: %s", result)
+	}
+}
+
+// A model repeating the same call with the same result is stopped on the
+// fourth time: that call does not run, it still gets its tool message, and
+// the run ends with StopNoProgress instead of spending up to MaxSteps.
+func TestRepeatedCallsEndTheRun(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	for i := 0; i < 6; i++ {
+		e.llm.push(toolCall(fmt.Sprintf("t%d", i), "get_order", `{"order_id":"O1"}`))
+	}
+	res, err := a.Chat(ctx, "look it up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StopReason != agent.StopNoProgress || len(e.llm.requests) != 4 {
+		t.Fatalf("stop %s after %d requests", res.StopReason, len(e.llm.requests))
+	}
+	all, _ := e.client.LatestMessages(ctx, a.SessionID(), 100)
+	last := all[len(all)-1]
+	if last.Role != "tool" || last.ToolCallID != "t3" || !strings.Contains(last.Content, "4 times in a row") {
+		t.Fatalf("last message: %+v", last)
+	}
+	// Different arguments are progress, not repetition.
+	e.llm.push(toolCall("u1", "get_order", `{"order_id":"O1"}`), toolCall("u2", "get_order", `{"order_id":"O2"}`),
+		toolCall("u3", "get_order", `{"order_id":"O1"}`), toolCall("u4", "get_order", `{"order_id":"O2"}`), text("done"))
+	if res, err := a.Chat(ctx, "both"); err != nil || res.StopReason != agent.StopCompleted {
+		t.Fatalf("%v %v", res, err)
 	}
 }
