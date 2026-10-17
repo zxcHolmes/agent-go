@@ -164,7 +164,7 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 		return false, err
 	}
 
-	usage := parseUsageFrom(res.ID, res.Usage)
+	usage := parseUsage(res.Usage)
 	rec := &UsageRecord{
 		ID: newID("llm"), SessionID: a.sessionID, MessageID: msg.ID, Model: a.cfg.Model,
 		ResponseID: res.ID, FinishReason: res.FinishReason, Usage: usage, RawUsage: res.Usage,

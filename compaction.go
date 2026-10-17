@@ -388,7 +388,7 @@ func (a *Agent) summaryCall(ctx context.Context, st *runState, req chatRequest, 
 		}
 		return "", nil, err
 	}
-	usage := parseUsageFrom(res.ID, res.Usage)
+	usage := parseUsage(res.Usage)
 	rec := &UsageRecord{
 		ID: newID("llm"), SessionID: a.sessionID, MessageID: messageID, Model: a.cfg.Model,
 		ResponseID: res.ID, FinishReason: res.FinishReason, Usage: usage, RawUsage: res.Usage,
