@@ -97,6 +97,12 @@ settlement. User-facing docs are in `README.md` (Chinese).
   (`latestUserBefore`, `inTurnRaw`) after the notes, so the window still opens
   with a user message. Only a first message too big on its own still ends in
   `ErrContextLengthExceeded`.
+- An LLM request that breaks off after a 2xx response (Stop, idle timeout,
+  dropped connection — not an error the provider reports in the stream) is
+  billed by estimate (`recordInterrupted`, `FinishInterrupted`, raw usage
+  `"estimated": true`): the estimated prompt, the previous call's part as
+  cache reads (`runState.prefix`), output at 3 bytes a token. Upstream bills
+  such requests and never reports their usage.
 - After a compaction, the last LLM call's token count no longer describes the
   window (`estimateTokens` checks this); usage rows of summary calls point at the
   compaction message, not an assistant message.

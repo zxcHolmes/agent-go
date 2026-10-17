@@ -130,7 +130,8 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	}
 
 	start := time.Now()
-	res, err := a.llm.stream(ctx, req, a.cfg.ExtraBody, onDelta)
+	var spend streamSpend
+	res, err := a.llm.streamSpend(ctx, req, a.cfg.ExtraBody, onDelta, &spend)
 	endStream()
 	if err != nil && ctx.Err() == nil {
 		a.log.Warn("llm request failed", "session", a.sessionID, "error", err)
@@ -138,11 +139,16 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	mu.Lock() // pairs with a timer callback that may have just run
 	defer mu.Unlock()
 	if err != nil {
+		messageID := ""
 		if msg != nil {
+			messageID = msg.ID
 			// Keep what was generated; partial tool calls are dropped.
 			if ferr := flush(MessageInterrupted, partial()); ferr != nil {
 				err = errors.Join(err, ferr)
 			}
+		}
+		if rerr := a.recordInterrupted(ctx, st, spend, est, st.prefix, messageID); rerr != nil {
+			err = errors.Join(err, rerr)
 		}
 		return false, err
 	}
@@ -195,6 +201,62 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	}
 	return len(msg.ToolCalls) > 0, nil
 }
+
+// recordInterrupted records an estimate of what LLM requests that broke off
+// (Stop, a timeout, a dropped connection) cost upstream, which reports no
+// usage for them. Without it a run stopped mid-reply is free, and stopping
+// every reply just before it ends would make the whole conversation free.
+// Each opened attempt is billed the estimated prompt — the part the previous
+// call already sent as cache reads, the rest as input — and the output is
+// estimated at 3 bytes a token. The record's finish_reason is "interrupted"
+// and its raw usage says it is an estimate.
+func (a *Agent) recordInterrupted(ctx context.Context, st *runState, spend streamSpend, est, prefix int, messageID string) error {
+	if spend.opened == 0 || est <= 0 {
+		return nil
+	}
+	if err := a.ownsLock(st); err != nil {
+		return nil // recovered meanwhile: the new owner bills its own calls
+	}
+	if prefix > est {
+		prefix = est
+	}
+	// One record per attempt. Only the last carries the message id and the
+	// output (an attempt is retried only before any text), so the next
+	// step's estimate (lastCallSize) reads one request, not the sum.
+	for i := 1; i <= spend.opened; i++ {
+		u := Usage{PromptTokens: int64(est), CachedTokens: int64(prefix)}
+		id, outBytes := "", 0
+		if i == spend.opened {
+			id, outBytes = messageID, spend.outBytes
+			u.CompletionTokens = int64((outBytes + 2) / 3)
+		}
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+		raw, _ := marshalJSON(struct {
+			Estimated        bool  `json:"estimated"`
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CachedTokens     int64 `json:"cached_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			OutputBytes      int   `json:"output_bytes"`
+		}{true, u.PromptTokens, u.CachedTokens, u.CompletionTokens, outBytes})
+		rec := &UsageRecord{
+			ID: newID("llm"), SessionID: a.sessionID, MessageID: id, Model: a.cfg.Model,
+			FinishReason: FinishInterrupted, Usage: u, RawUsage: raw, CreatedAt: time.Now(),
+		}
+		if a.cfg.Billing != nil {
+			rec.Cost = a.cfg.Billing.Cost(a.cfg.Model, u)
+		}
+		a.log.Info("llm request broke off, usage estimated", "session", a.sessionID,
+			"prompt_tokens", u.PromptTokens, "cached_tokens", u.CachedTokens, "completion_tokens", u.CompletionTokens)
+		if err := a.recordUsage(ctx, st, rec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FinishInterrupted is the finish_reason of a usage record estimated for an
+// LLM request that broke off before reporting its usage.
+const FinishInterrupted = "interrupted"
 
 // cutOff reports a reply that stopped at the output limit ("length" in the
 // OpenAI format, "max_tokens" from relays that pass Anthropic's through).

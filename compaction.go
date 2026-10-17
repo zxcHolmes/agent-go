@@ -100,7 +100,10 @@ func (a *Agent) estimateTokens(st *runState, window []Message, marker *Message) 
 		ok = false // that call predates the compaction; its size no longer applies
 	}
 	est := int(used)
-	if !ok {
+	st.prefix = 0
+	if ok {
+		st.prefix = est
+	} else {
 		est = len(a.system) / 3
 		for _, t := range a.tools {
 			est += len(t) / 3
@@ -360,12 +363,12 @@ func (a *Agent) summarize(ctx context.Context, st *runState, window []Message, e
 	}
 	// The tools stay in the request: they are part of the cached prefix.
 	req := chatRequest{Model: a.cfg.Model, Messages: msgs, Tools: a.tools}
-	return a.summaryCall(ctx, req, est+len(ask)/3, summaryMaxTokens, messageID)
+	return a.summaryCall(ctx, st, req, est+len(ask)/3, summaryMaxTokens, messageID)
 }
 
 // summaryCall sends one summary request and records its usage against the
 // compaction message.
-func (a *Agent) summaryCall(ctx context.Context, req chatRequest, est, maxTokens int, messageID string) (string, *UsageRecord, error) {
+func (a *Agent) summaryCall(ctx context.Context, st *runState, req chatRequest, est, maxTokens int, messageID string) (string, *UsageRecord, error) {
 	if a.cfg.UseMaxCompletionTokens {
 		req.MaxCompletionTokens = maxTokens
 	} else {
@@ -375,8 +378,14 @@ func (a *Agent) summaryCall(ctx context.Context, req chatRequest, est, maxTokens
 		return "", nil, &rejectedError{err}
 	}
 	start := time.Now()
-	res, err := a.llm.stream(ctx, req, a.cfg.ExtraBody, nil)
+	var spend streamSpend
+	res, err := a.llm.streamSpend(ctx, req, a.cfg.ExtraBody, nil, &spend)
 	if err != nil {
+		// Billed like a step that broke off; usage rows of summary calls point
+		// at the compaction message.
+		if rerr := a.recordInterrupted(ctx, st, spend, est, st.prefix, messageID); rerr != nil {
+			err = errors.Join(err, rerr)
+		}
 		return "", nil, err
 	}
 	usage := parseUsage(res.Usage)

@@ -107,6 +107,15 @@ func (a *streamAccumulator) addToolCall(d deltaToolCall) {
 	tc.Function.Arguments += d.Function.Arguments
 }
 
+// size is how much output the stream has produced so far, in bytes.
+func (a *streamAccumulator) size() int {
+	n := a.content.Len() + a.reasoning.Len()
+	for _, tc := range a.ToolCalls {
+		n += len(tc.Function.Arguments)
+	}
+	return n
+}
+
 func (a *streamAccumulator) result() *streamResult {
 	r := a.streamResult
 	r.Content, r.Reasoning = a.content.String(), a.reasoning.String()

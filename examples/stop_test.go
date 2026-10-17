@@ -298,6 +298,16 @@ func TestStopDuringStream(t *testing.T) {
 	if last.Status != agent.MessageInterrupted || last.Content != "Hello " {
 		t.Fatalf("partial message: %+v", last)
 	}
+	// The stopped request reported no usage, so an estimate is billed: the
+	// prompt the request carried and the output it had produced ("Hello ").
+	recs, _ := e.client.ListUsage(ctx, a.SessionID())
+	if len(recs) != 1 || recs[0].FinishReason != agent.FinishInterrupted || recs[0].MessageID != last.ID ||
+		recs[0].Usage.PromptTokens <= 0 || recs[0].Usage.CompletionTokens != 2 || recs[0].Cost.Total <= 0 {
+		t.Fatalf("estimated usage: %+v", recs)
+	}
+	if !strings.Contains(string(recs[0].RawUsage), `"estimated":true`) {
+		t.Fatalf("raw usage must say it is an estimate: %s", recs[0].RawUsage)
+	}
 	// The partial answer stays in the history for the next turn.
 	e.llm.push(text("ok"))
 	if _, err := a.Chat(ctx, "go on"); err != nil {
@@ -306,6 +316,42 @@ func TestStopDuringStream(t *testing.T) {
 	msgs := e.llm.request(1)
 	if !strings.Contains(string(msgs[2]), `"content":"Hello "`) {
 		t.Fatalf("history: %s", msgs[2])
+	}
+}
+
+// A request stopped later in a conversation: the part of its prompt the
+// previous call already sent is billed as cache reads, the rest as input.
+func TestStopBillsPrefixAsCacheReads(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	e.llm.pushReply(reply{msg: text("first answer"), hangAfter: -1, prompt: 5000})
+	if _, err := a.Chat(ctx, "one"); err != nil {
+		t.Fatal(err)
+	}
+	e.llm.pushReply(reply{msg: text("second answer, long"), hangAfter: 1})
+	done := make(chan struct{})
+	go func() {
+		_, _ = a.Chat(ctx, "two")
+		close(done)
+	}()
+	<-e.llm.hung
+	if err := a.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	recs, _ := e.client.ListUsage(ctx, a.SessionID())
+	last := recs[len(recs)-1]
+	prev := recs[len(recs)-2]
+	if last.FinishReason != agent.FinishInterrupted {
+		t.Fatalf("records: %+v", recs)
+	}
+	sent := prev.Usage.PromptTokens + prev.Usage.CompletionTokens
+	if last.Usage.CachedTokens != sent || last.Usage.PromptTokens <= sent {
+		t.Fatalf("prefix %d, estimate %+v", sent, last.Usage)
+	}
+	if last.Cost.CachedInput <= 0 || last.Cost.Input <= 0 {
+		t.Fatalf("cost %+v", last.Cost)
 	}
 }
 

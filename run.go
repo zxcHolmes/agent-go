@@ -19,8 +19,11 @@ type runState struct {
 	db       context.Context // not cancelled by Stop, so bookkeeping always completes
 	cancel   context.CancelCauseFunc
 	startSeq int64 // messages with a greater seq were produced by this run
-	res      *RunResult
-	start    time.Time
+	// prefix is the part of the latest estimate that the previous call
+	// already sent (likely in the provider's cache); see estimateTokens.
+	prefix int
+	res    *RunResult
+	start  time.Time
 }
 
 // run acquires the session and drives it. With loop=false it only heals the

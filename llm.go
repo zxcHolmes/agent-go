@@ -62,7 +62,22 @@ func (e *streamBrokenError) Unwrap() error { return e.err }
 
 var errIdleTimeout = errors.New("agent: llm stream idle timeout")
 
+// streamSpend is what failed attempts may still have cost upstream, which
+// never reports usage for them: the usage comes in the stream's last chunk.
+// An attempt counts once the provider has accepted it (a 2xx response) and it
+// breaks off without reporting an error of its own — stopped, timed out, or
+// cut by the network; its prompt was processed and its output so far made.
+type streamSpend struct {
+	opened   int // attempts that broke off after a 2xx response
+	outBytes int // text, reasoning and tool-call arguments they produced
+}
+
 func (c *llmClient) stream(ctx context.Context, req chatRequest, extra map[string]any, onDelta deltaFunc) (*streamResult, error) {
+	return c.streamSpend(ctx, req, extra, onDelta, nil)
+}
+
+// streamSpend is stream, adding to spend what failed attempts may have cost.
+func (c *llmClient) streamSpend(ctx context.Context, req chatRequest, extra map[string]any, onDelta deltaFunc, spend *streamSpend) (*streamResult, error) {
 	req.Stream = true
 	req.StreamOptions = &streamOptions{IncludeUsage: true}
 	body, err := buildBody(req, extra)
@@ -80,7 +95,7 @@ func (c *llmClient) stream(ctx context.Context, req chatRequest, extra map[strin
 			case <-t.C:
 			}
 		}
-		res, retry, err := c.doStream(ctx, body, onDelta)
+		res, retry, err := c.doStream(ctx, body, onDelta, spend)
 		if err == nil {
 			return res, nil
 		}
@@ -95,7 +110,7 @@ func (c *llmClient) stream(ctx context.Context, req chatRequest, extra map[strin
 	return nil, lastErr
 }
 
-func (c *llmClient) doStream(parent context.Context, body []byte, onDelta deltaFunc) (*streamResult, bool, error) {
+func (c *llmClient) doStream(parent context.Context, body []byte, onDelta deltaFunc, spend *streamSpend) (_ *streamResult, _ bool, err error) {
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
 	var idle *time.Timer
@@ -130,6 +145,13 @@ func (c *llmClient) doStream(parent context.Context, body []byte, onDelta deltaF
 	}
 
 	acc := &streamAccumulator{}
+	refused := false // the provider reported an error in the stream: nothing to bill
+	defer func() {
+		if err != nil && !refused && spend != nil {
+			spend.opened++
+			spend.outBytes += acc.size()
+		}
+	}()
 	// started is set once text or reasoning has been handed to onDelta. Only
 	// that output is visible outside this call (it is flushed to the store and
 	// streamed to the caller); a role-only chunk or tool-call fragments live in
@@ -188,6 +210,7 @@ func (c *llmClient) doStream(parent context.Context, body []byte, onDelta deltaF
 					status = code
 				}
 				retry := !started && (code == http.StatusTooManyRequests || code >= 500)
+				refused = true
 				return nil, retry, &APIError{StatusCode: status, Body: truncate(string(chunk.Error), 2000)}
 			}
 			content, reasoning := acc.add(&chunk)

@@ -53,6 +53,13 @@ func TestInStreamTransientErrorIsRetried(t *testing.T) {
 	if _, err := a.Chat(context.Background(), "again"); !errors.As(err, &ae) || ae.StatusCode != 400 {
 		t.Fatalf("got %v", err)
 	}
+	// An error the provider reports itself is not billed as a broken-off request.
+	recs, _ := e.client.ListUsage(context.Background(), a.SessionID())
+	for _, r := range recs {
+		if r.FinishReason == agent.FinishInterrupted {
+			t.Fatalf("a provider error must not be estimated: %+v", r)
+		}
+	}
 }
 
 // Seen live: a proxy reset the connection while the model was emitting a tool
