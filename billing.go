@@ -41,9 +41,10 @@ func parseUsage(raw json.RawMessage) Usage {
 		CompletionTokens    int64 `json:"completion_tokens"`
 		TotalTokens         int64 `json:"total_tokens"`
 		PromptTokensDetails struct {
-			CachedTokens     int64 `json:"cached_tokens"`
-			CacheWriteTokens int64 `json:"cache_write_tokens"`
-			AudioTokens      int64 `json:"audio_tokens"`
+			CachedTokens             int64  `json:"cached_tokens"`
+			CacheWriteTokens         int64  `json:"cache_write_tokens"`
+			CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens"`
+			AudioTokens              int64  `json:"audio_tokens"`
 		} `json:"prompt_tokens_details"`
 		CompletionTokensDetails struct {
 			ReasoningTokens          int64 `json:"reasoning_tokens"`
@@ -54,21 +55,37 @@ func parseUsage(raw json.RawMessage) Usage {
 		PromptCacheHitTokens     int64 `json:"prompt_cache_hit_tokens"`
 		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		// Set by gateways (new-api / one-api) relaying Claude in the OpenAI
+		// format, which keep Anthropic's meaning of prompt_tokens.
+		ClaudeCacheCreation5m *int64 `json:"claude_cache_creation_5_m_tokens"`
 	}
 	if len(raw) == 0 || json.Unmarshal(raw, &u) != nil {
 		return Usage{}
+	}
+	var detailsWrite int64
+	if u.PromptTokensDetails.CacheCreationInputTokens != nil {
+		detailsWrite = *u.PromptTokensDetails.CacheCreationInputTokens
 	}
 	out := Usage{
 		PromptTokens:             u.PromptTokens,
 		CompletionTokens:         u.CompletionTokens,
 		TotalTokens:              u.TotalTokens,
 		CachedTokens:             firstNonZero(u.PromptTokensDetails.CachedTokens, u.PromptCacheHitTokens, u.CacheReadInputTokens),
-		CacheWriteTokens:         firstNonZero(u.PromptTokensDetails.CacheWriteTokens, u.CacheCreationInputTokens),
+		CacheWriteTokens:         firstNonZero(u.PromptTokensDetails.CacheWriteTokens, detailsWrite, u.CacheCreationInputTokens),
 		ReasoningTokens:          u.CompletionTokensDetails.ReasoningTokens,
 		AudioInputTokens:         u.PromptTokensDetails.AudioTokens,
 		AudioOutputTokens:        u.CompletionTokensDetails.AudioTokens,
 		AcceptedPredictionTokens: u.CompletionTokensDetails.AcceptedPredictionTokens,
 		RejectedPredictionTokens: u.CompletionTokensDetails.RejectedPredictionTokens,
+	}
+	// Usage counts PromptTokens the OpenAI way: every prompt token, cached or
+	// not. A Claude relay reports only the uncached ones there (cache reads and
+	// writes beside them), which priced reads and writes as free and made the
+	// context estimate a fraction of the real prompt: add them back. Its marks
+	// are its own fields, or more tokens read from cache than prompt_tokens.
+	if u.ClaudeCacheCreation5m != nil || u.PromptTokensDetails.CacheCreationInputTokens != nil || out.CachedTokens > out.PromptTokens {
+		out.PromptTokens += out.CachedTokens + out.CacheWriteTokens
+		out.TotalTokens = out.PromptTokens + out.CompletionTokens
 	}
 	if out.TotalTokens == 0 {
 		out.TotalTokens = out.PromptTokens + out.CompletionTokens

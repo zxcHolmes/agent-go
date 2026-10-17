@@ -2,6 +2,7 @@ package examples
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -98,5 +99,31 @@ func TestStreamBreakAfterTextRetriesTheStepOnce(t *testing.T) {
 	e.llm.pushReply(reply{msg: text("Let me look that up for you"), hangAfter: -1, cut: 2})
 	if _, err := a.Chat(context.Background(), "again"); err == nil || !strings.Contains(err.Error(), "llm stream interrupted") {
 		t.Fatalf("want a broken stream error, got %v", err)
+	}
+}
+
+// A reply cut off at max_tokens while writing a tool call: the call does not
+// run, and the model is told it hit the output limit and to split the work,
+// not handed a parse error it would answer by resending the same call.
+func TestToolCallCutOffAtOutputLimit(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	a := e.newAgent(t, "")
+	cut, _ := json.Marshal(`{"jsonrpc":"2.0","method":"get_order","params":{"order_id":"O`)
+	e.llm.pushReply(reply{msg: `{"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"json_rpc","arguments":` + string(cut) + `}}]}`,
+		hangAfter: -1, finish: "length"})
+	e.llm.push(text("ok, in parts"))
+	if _, err := a.Chat(ctx, "write it"); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := e.client.LatestMessages(ctx, a.SessionID(), 100)
+	var result string
+	for _, m := range all {
+		if m.Role == "tool" && m.ToolCallID == "t1" {
+			result = m.Content
+		}
+	}
+	if !strings.Contains(result, "output limit") || !strings.Contains(result, "Split the work") {
+		t.Fatalf("tool result: %s", result)
 	}
 }

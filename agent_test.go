@@ -24,6 +24,34 @@ func TestParseUsage(t *testing.T) {
 	}
 }
 
+// A gateway relaying Claude reports prompt_tokens without the cache reads and
+// writes (real rows from new-api); they are added back so PromptTokens is the
+// whole prompt, as for every other provider.
+func TestParseUsageClaudeRelay(t *testing.T) {
+	write := parseUsage(json.RawMessage(`{"prompt_tokens":5154,"completion_tokens":1445,"total_tokens":6599,
+		"prompt_tokens_details":{"cached_tokens":0,"cache_creation_input_tokens":29206,"text_tokens":0,"audio_tokens":0,"image_tokens":0},
+		"completion_tokens_details":{"text_tokens":0,"audio_tokens":0,"reasoning_tokens":0},
+		"input_tokens":0,"output_tokens":0,"input_tokens_details":null,"claude_cache_creation_5_m_tokens":0,"claude_cache_creation_1_h_tokens":0}`))
+	if write.PromptTokens != 5154+29206 || write.CacheWriteTokens != 29206 || write.TotalTokens != 5154+29206+1445 {
+		t.Fatalf("cache write: %+v", write)
+	}
+	read := parseUsage(json.RawMessage(`{"prompt_tokens":1396,"completion_tokens":22,"total_tokens":1418,
+		"prompt_tokens_details":{"cached_tokens":7908,"text_tokens":0,"audio_tokens":0,"image_tokens":0}}`))
+	if read.PromptTokens != 1396+7908 || read.CachedTokens != 7908 {
+		t.Fatalf("cache read without the relay's own fields: %+v", read)
+	}
+	p := Pricing{Input: 800, CacheRead: 80, CacheWrite: 1600, Output: 4000}
+	c := p.Cost("m", write)
+	if math.Abs(c.Input-5154*800/1e6) > 1e-9 || math.Abs(c.CacheWrite-29206*1600/1e6) > 1e-9 {
+		t.Fatalf("cost %+v", c)
+	}
+	// The OpenAI meaning is left alone: prompt_tokens already counts the cache.
+	std := parseUsage(json.RawMessage(`{"prompt_tokens":29452,"completion_tokens":2845,"total_tokens":32297,"prompt_tokens_details":{"cached_tokens":29056}}`))
+	if std.PromptTokens != 29452 || std.TotalTokens != 32297 {
+		t.Fatalf("standard usage changed: %+v", std)
+	}
+}
+
 func TestPricing(t *testing.T) {
 	p := Pricing{Input: 100, Output: 1000, CacheRead: 10}
 	c := p.Cost("m", Usage{PromptTokens: 1_000_000, CachedTokens: 400_000, CompletionTokens: 100_000})

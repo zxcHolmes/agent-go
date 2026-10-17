@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -177,6 +178,12 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 	loaded := a.loadedDocsIn(history) // exactly what this request sent
 	for i, tc := range msg.ToolCalls {
 		c := a.newCall(ctx, msg, i, tc, loaded)
+		if cutOff(res.FinishReason) && !json.Valid([]byte(tc.Function.Arguments)) {
+			// The reply hit max_tokens while writing this call. A parse error
+			// would only make the model resend the same call and be cut off
+			// again; say what happened and how to avoid it.
+			c.Status, c.Result = CallDone, rpcErrorResponse(c.RPCID, truncatedCallError(maxTokens))
+		}
 		if err := a.createCall(ctx, st, &c); err != nil {
 			return false, err
 		}
@@ -187,6 +194,18 @@ func (a *Agent) step(ctx context.Context, st *runState) (bool, error) {
 		return false, err
 	}
 	return len(msg.ToolCalls) > 0, nil
+}
+
+// cutOff reports a reply that stopped at the output limit ("length" in the
+// OpenAI format, "max_tokens" from relays that pass Anthropic's through).
+func cutOff(finishReason string) bool {
+	return finishReason == "length" || finishReason == "max_tokens"
+}
+
+func truncatedCallError(maxTokens int) *RPCError {
+	return &RPCError{Code: CodeParseError, Message: fmt.Sprintf(
+		"your reply reached the output limit (%d tokens, reasoning included) while writing this call, so its arguments were cut off and nothing ran. "+
+			"Do not resend it whole: it would be cut off again. Split the work into smaller calls that each write a part, and keep your reasoning before each call short.", maxTokens)}
 }
 
 // replayable drops messages that must not be sent to the model: interrupted

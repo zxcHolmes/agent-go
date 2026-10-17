@@ -216,7 +216,7 @@ a, err := client.Agent(ctx, sid, agent.AgentOptions{
 
 **运行只能通过 `Stop` 停止**：传给 `Chat` / `ChatMessage` / `Continue` / `Confirm` 的 ctx 只在开始运行之前有效（ctx 已经取消就直接返回错误，不会开始运行）。运行开始后再取消 ctx 不会影响它（ctx 里的值仍然可以在 handler 中取到）。所以在 goroutine 里直接传 HTTP 请求的 ctx 是安全的：请求结束了，运行照常继续。要停止运行就调用 `Stop`。
 
-**输出被截断**：模型输出达到 `max_tokens` 时，本次运行正常结束（`StopReason = completed`），`RunResult.FinishReason` 为 `"length"`，调用 `Continue` 让模型接着写。如果截断发生在工具调用的参数中间，这个调用不会执行，模型会收到 `-32700` 错误结果并自行处理。`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
+**输出被截断**：模型输出达到 `max_tokens` 时，本次运行正常结束（`StopReason = completed`），`RunResult.FinishReason` 为 `"length"`，调用 `Continue` 让模型接着写。如果截断发生在工具调用的参数中间（`finish_reason` 为 `length` 或 `max_tokens`，参数不是完整 JSON），这个调用不会执行，模型收到的 `-32700` 错误会说明“输出达到上限（N token，含思考）被截断，不要原样重发，拆成几次小调用、调用前少想”，而不是一句 JSON 解析失败——否则模型会原样重发、再被截断。`RunResult` 还包含本次新增的消息 `Messages`、`PendingCalls`、本次 `Usage` 和 `Cost`，`res.Reply()` 取最后一条助手文本。
 
 **状态与并发**：每个会话同一时间只能有一个运行，通过数据库行锁实现（跨进程有效）。会话在运行中再调用 `Chat` 返回 `ErrBusy`；等待确认时调用 `Chat` / `Continue` 返回 `ErrWaitingConfirmation`。运行期间后台每几秒心跳一次（流式输出和长时间的 RPC 调用中也会），超过 `Config.StaleAfter`（默认 1 分钟）没有心跳的会话可被其他运行接管；运行中的更新都带上 `run_id` 条件，被接管的旧运行即使还没察觉，也写不进任何东西。进程重启时由 `NewClient` 统一恢复，见“异常恢复”。
 
@@ -597,7 +597,7 @@ act.Sessions            // 一页会话：非 idle 的排前面，其余按 upda
 
 ### Token 记录与计费
 
-每次 LLM 调用都会写一条 `agent_llm_calls` 记录，包括：`prompt_tokens`、`completion_tokens`、`total_tokens`、`cached_tokens`（缓存读）、`cache_write_tokens`、`reasoning_tokens`、音频输入/输出、预测 accepted/rejected，以及接口返回的**原始 usage JSON**、finish_reason、延迟、各项积分。兼容 OpenAI、DeepSeek（`prompt_cache_hit_tokens`）、Anthropic 风格（`cache_read_input_tokens` / `cache_creation_input_tokens`）字段。
+每次 LLM 调用都会写一条 `agent_llm_calls` 记录，包括：`prompt_tokens`、`completion_tokens`、`total_tokens`、`cached_tokens`（缓存读）、`cache_write_tokens`、`reasoning_tokens`、音频输入/输出、预测 accepted/rejected，以及接口返回的**原始 usage JSON**、finish_reason、延迟、各项积分。兼容 OpenAI、DeepSeek（`prompt_cache_hit_tokens`）、Anthropic 风格（`cache_read_input_tokens` / `cache_creation_input_tokens`）字段。`prompt_tokens` 一律按 OpenAI 的含义记录（包含缓存读写）：new-api 一类网关转发 Claude 时 `prompt_tokens` 只含未缓存部分（带 `claude_cache_creation_5_m_tokens` 或 `prompt_tokens_details.cache_creation_input_tokens` 字段，或缓存读多于 `prompt_tokens`），解析时把缓存读写加回去，否则缓存读写不计费、上下文估算也会严重偏小。
 
 ```go
 // 单一价格，单位：积分 / 百万 token
